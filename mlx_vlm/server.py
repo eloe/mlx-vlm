@@ -382,6 +382,10 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Up to 4 sequences where the API will stop generating further tokens.",
+    )
 
     def generation_kwargs(self) -> dict[str, Any]:
         kwargs = self.dump_kwargs("max_output_tokens")
@@ -559,6 +563,10 @@ class VLMRequest(GenerationParams, TemplateParams):
         description="Maximum number of tokens to generate.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Up to 4 sequences where the API will stop generating further tokens.",
+    )
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
         description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
@@ -628,6 +636,28 @@ class ChatStreamChunk(BaseModel):
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
+
+
+def resolve_stop_sequences(
+    stop: Optional[Union[str, list]],
+) -> Optional[list]:
+    """Normalize stop sequences for the generation stopping criteria.
+
+    The generation pipeline's ``add_eos_token_ids`` accepts strings
+    and handles tokenization internally.
+
+    Args:
+        stop: A single stop string or list of stop strings, or None.
+
+    Returns:
+        A list of stop strings (max 4), or None.
+    """
+    if not stop:
+        return None
+    if isinstance(stop, str):
+        stop = [stop]
+    sequences = [s for s in stop[:4] if isinstance(s, str) and s]
+    return sequences if sequences else None
 
 
 def build_generation_kwargs(
@@ -846,6 +876,11 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
+
+        # Resolve stop sequences to token IDs
+        stop_seqs = resolve_stop_sequences(getattr(openai_request, "stop", None))
+        if stop_seqs:
+            generation_kwargs["eos_tokens"] = stop_seqs
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -1114,6 +1149,11 @@ async def chat_completions_endpoint(request: ChatRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
+
+        # Resolve stop sequences to token IDs
+        stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
+        if stop_seqs:
+            generation_kwargs["eos_tokens"] = stop_seqs
 
         if request.stream:
             # Streaming response
