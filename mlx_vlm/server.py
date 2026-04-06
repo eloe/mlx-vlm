@@ -51,7 +51,10 @@ def get_prefill_step_size():
 
 def get_max_context_tokens() -> int:
     """Maximum prompt tokens before rejecting a request. 0 = no limit."""
-    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+    value = int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+    if value < 0:
+        raise ValueError(f"MAX_CONTEXT_TOKENS must be >= 0, got {value}")
+    return value
 
 
 def check_context_length(prompt: str, processor, max_context: int) -> None:
@@ -1481,6 +1484,8 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.max_context_tokens < 0:
+        parser.error("--max-context-tokens must be >= 0")
     os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
 
     uvicorn.run(

@@ -158,14 +158,17 @@ def test_check_context_length_zero_unlimited():
     server.check_context_length("anything", None, 0)
 
 
-def test_get_max_context_tokens_default():
-    import os
-    os.environ.pop("MAX_CONTEXT_TOKENS", None)
+def test_get_max_context_tokens_default(monkeypatch):
+    monkeypatch.delenv("MAX_CONTEXT_TOKENS", raising=False)
     assert server.get_max_context_tokens() == 0
 
 
-def test_get_max_context_tokens_from_env():
-    import os
-    os.environ["MAX_CONTEXT_TOKENS"] = "16384"
+def test_get_max_context_tokens_from_env(monkeypatch):
+    monkeypatch.setenv("MAX_CONTEXT_TOKENS", "16384")
     assert server.get_max_context_tokens() == 16384
-    os.environ.pop("MAX_CONTEXT_TOKENS")
+
+
+def test_get_max_context_tokens_rejects_negative(monkeypatch):
+    monkeypatch.setenv("MAX_CONTEXT_TOKENS", "-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        server.get_max_context_tokens()
