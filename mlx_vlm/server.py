@@ -47,8 +47,18 @@ DEFAULT_SERVER_PORT = 8080
 DEFAULT_REQUEST_TIMEOUT = 300
 
 
-def get_request_timeout():
-    return int(os.environ.get("REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT))
+def get_request_timeout() -> int:
+    """Request timeout in seconds. Must be > 0."""
+    try:
+        value = int(os.environ.get("REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT))
+    except ValueError:
+        raise ValueError(
+            f"REQUEST_TIMEOUT must be a valid integer, got: "
+            f"{os.environ.get('REQUEST_TIMEOUT')!r}"
+        )
+    if value <= 0:
+        raise ValueError(f"REQUEST_TIMEOUT must be > 0, got {value}")
+    return value
 
 
 def get_prefill_step_size():
@@ -57,7 +67,10 @@ def get_prefill_step_size():
 
 def get_max_context_tokens() -> int:
     """Maximum prompt tokens before rejecting a request. 0 means no limit."""
-    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+    value = int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+    if value < 0:
+        raise ValueError(f"MAX_CONTEXT_TOKENS must be >= 0, got {value}")
+    return value
 
 
 def check_context_length(prompt: str, processor, max_context: int) -> None:
@@ -1046,9 +1059,12 @@ async def responses_endpoint(openai_request: OpenAIRequest, raw_request: Request
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py, with request timeout
+                # Use generate from generate.py, with request timeout.
+                # NOTE: wait_for cancels the future but cannot interrupt the
+                # sync generate() running in the thread pool. The thread will
+                # run to completion; only the await is aborted.
                 timeout = get_request_timeout()
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 try:
                     result = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -1323,9 +1339,12 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py, with request timeout
+                # Use generate from generate.py, with request timeout.
+                # NOTE: wait_for cancels the future but cannot interrupt the
+                # sync generate() running in the thread pool. The thread will
+                # run to completion; only the await is aborted.
                 timeout = get_request_timeout()
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 try:
                     gen_result = await asyncio.wait_for(
                         loop.run_in_executor(

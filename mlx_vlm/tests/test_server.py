@@ -1,4 +1,3 @@
-import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -136,19 +135,30 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
 # --- Request cancellation tests ---
 
 
-def test_get_request_timeout_default():
+def test_get_request_timeout_default(monkeypatch):
     """Default timeout should be 300 seconds when env var is unset."""
-    os.environ.pop("REQUEST_TIMEOUT", None)
+    monkeypatch.delenv("REQUEST_TIMEOUT", raising=False)
     assert server.get_request_timeout() == 300
 
 
-def test_get_request_timeout_from_env():
+def test_get_request_timeout_from_env(monkeypatch):
     """REQUEST_TIMEOUT env var should override the default."""
-    os.environ["REQUEST_TIMEOUT"] = "60"
-    try:
-        assert server.get_request_timeout() == 60
-    finally:
-        os.environ.pop("REQUEST_TIMEOUT", None)
+    monkeypatch.setenv("REQUEST_TIMEOUT", "60")
+    assert server.get_request_timeout() == 60
+
+
+def test_get_request_timeout_rejects_invalid(monkeypatch):
+    """REQUEST_TIMEOUT with non-integer value should raise ValueError."""
+    monkeypatch.setenv("REQUEST_TIMEOUT", "not_a_number")
+    with pytest.raises(ValueError, match="valid integer"):
+        server.get_request_timeout()
+
+
+def test_get_request_timeout_rejects_zero(monkeypatch):
+    """REQUEST_TIMEOUT of 0 should raise ValueError."""
+    monkeypatch.setenv("REQUEST_TIMEOUT", "0")
+    with pytest.raises(ValueError, match="must be > 0"):
+        server.get_request_timeout()
 
 
 def test_default_request_timeout_constant():
@@ -158,8 +168,6 @@ def test_default_request_timeout_constant():
 
 def test_non_streaming_responses_timeout(client):
     """Non-streaming /responses should return 504 when generation exceeds timeout."""
-    import asyncio
-
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -226,3 +234,46 @@ def test_non_streaming_chat_completions_timeout(client):
 
     assert response.status_code == 504
     assert "timed out" in response.json()["detail"]
+
+
+# --- Context length rejection tests ---
+
+
+def test_check_context_length_within_limit():
+    """Prompt within limit should not raise."""
+    fake_proc = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(10))),
+    )
+    server.check_context_length("short", fake_proc, 100)
+
+
+def test_check_context_length_exceeds_limit():
+    """Prompt exceeding limit should raise 400."""
+    from fastapi import HTTPException as _Exc
+    fake_proc = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(200))),
+    )
+    with pytest.raises(_Exc) as exc_info:
+        server.check_context_length("long", fake_proc, 100)
+    assert exc_info.value.status_code == 400
+
+
+def test_check_context_length_zero_unlimited():
+    """max_context=0 should skip the check entirely."""
+    server.check_context_length("anything", None, 0)
+
+
+def test_get_max_context_tokens_default(monkeypatch):
+    monkeypatch.delenv("MAX_CONTEXT_TOKENS", raising=False)
+    assert server.get_max_context_tokens() == 0
+
+
+def test_get_max_context_tokens_from_env(monkeypatch):
+    monkeypatch.setenv("MAX_CONTEXT_TOKENS", "16384")
+    assert server.get_max_context_tokens() == 16384
+
+
+def test_get_max_context_tokens_rejects_negative(monkeypatch):
+    monkeypatch.setenv("MAX_CONTEXT_TOKENS", "-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        server.get_max_context_tokens()
