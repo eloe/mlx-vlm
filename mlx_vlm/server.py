@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -31,6 +32,7 @@ from .generate import (
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
+    PromptCacheState,
     generate,
     normalize_resize_shape,
     stream_generate,
@@ -85,6 +87,16 @@ def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
 
+async def _prompt_cache_cleanup_loop():
+    """Background task that periodically evicts stale prompt caches."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            evict_stale_prompt_caches()
+        except Exception as e:
+            print(f"[prompt_cache] Cleanup error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app):
     # Startup
@@ -97,7 +109,19 @@ async def lifespan(app):
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
+
+    # Start prompt cache cleanup task
+    ttl = get_prompt_cache_ttl()
+    cleanup_task = None
+    if ttl > 0:
+        cleanup_task = asyncio.create_task(_prompt_cache_cleanup_loop())
+        print(f"[prompt_cache] Cleanup task started (TTL={ttl}s, check every 60s)")
+
     yield
+
+    # Shutdown
+    if cleanup_task is not None:
+        cleanup_task.cancel()
     unload_model_sync()
 
 
@@ -121,6 +145,57 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+
+# Prompt cache: reuse KV state across requests with the same prompt prefix.
+# Keyed by model name — one PromptCacheState per loaded model.
+DEFAULT_PROMPT_CACHE_TTL = 300  # seconds
+
+
+def get_prompt_cache_ttl() -> int:
+    """Prompt cache TTL in seconds. 0 = no expiry."""
+    return int(os.environ.get("PROMPT_CACHE_TTL", DEFAULT_PROMPT_CACHE_TTL))
+
+
+_prompt_cache_states: dict[str, PromptCacheState] = {}
+
+
+def get_prompt_cache_state(
+    model_name: str,
+    cache_key: Optional[str] = None,
+) -> PromptCacheState:
+    """Get or create a PromptCacheState for the given model and cache key.
+
+    Args:
+        model_name: The model identifier.
+        cache_key: Optional routing key (e.g., prompt_cache_key from request).
+    """
+    key = f"{model_name}::{cache_key}" if cache_key else model_name
+    if key not in _prompt_cache_states:
+        _prompt_cache_states[key] = PromptCacheState()
+    state = _prompt_cache_states[key]
+    state.touch()
+    return state
+
+
+def evict_stale_prompt_caches() -> int:
+    """Remove prompt cache entries that exceed the TTL. Returns count evicted."""
+    ttl = get_prompt_cache_ttl()
+    if ttl <= 0:
+        return 0
+    now = time.time()
+    stale_keys = [
+        k for k, v in _prompt_cache_states.items()
+        if (now - v.last_used) > ttl
+    ]
+    for k in stale_keys:
+        entry = _prompt_cache_states.pop(k)
+        tokens = entry.token_count
+        entry.invalidate()
+        print(f"[prompt_cache] Evicted '{k}' ({tokens} tokens, idle {now - entry.last_used:.0f}s)")
+    if stale_keys:
+        gc.collect()
+        mx.clear_cache()
+    return len(stale_keys)
 
 
 class FlexibleBaseModel(BaseModel):
@@ -204,6 +279,8 @@ def unload_model_sync():
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
     model_cache = {}
+    # Clear prompt cache states
+    _prompt_cache_states.clear()
     # Force garbage collection
     gc.collect()
     mx.clear_cache()
@@ -898,13 +975,15 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
                     yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                    # Stream text deltas
+                    # Stream text deltas (with prompt cache reuse)
+                    cache_state = get_prompt_cache_state(openai_request.model)
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **generation_kwargs,
                     )
 
@@ -961,7 +1040,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -983,12 +1062,14 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             # Non-streaming response
             try:
                 # Use generate from generate.py
+                cache_state = get_prompt_cache_state(openai_request.model)
                 result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=images,
                     verbose=False,  # stats are passed in the response
+                    prompt_cache_state=cache_state,
                     **generation_kwargs,
                 )
                 # Clean up resources
@@ -1031,7 +1112,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1120,7 +1201,8 @@ async def chat_completions_endpoint(request: ChatRequest):
             async def stream_generator():
                 token_iterator = None
                 try:
-                    # Use stream_generate from utils
+                    # Use stream_generate with prompt cache reuse
+                    cache_state = get_prompt_cache_state(request.model)
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -1128,6 +1210,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         image=images,
                         audio=audio,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **generation_kwargs,
                     )
 
@@ -1202,7 +1285,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -1224,6 +1307,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             # Non-streaming response
             try:
                 # Use generate from generate.py
+                cache_state = get_prompt_cache_state(request.model)
                 gen_result = generate(
                     model=model,
                     processor=processor,
@@ -1232,6 +1316,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     audio=audio,
                     verbose=False,  # Keep API output clean
                     vision_cache=model_cache.get("vision_cache"),
+                    prompt_cache_state=cache_state,
                     **generation_kwargs,
                 )
                 # Clean up resources
@@ -1281,7 +1366,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1434,6 +1519,14 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--prompt-cache-ttl",
+        type=int,
+        default=DEFAULT_PROMPT_CACHE_TTL,
+        help="Seconds of idle time before a prompt cache entry is evicted. "
+        "Frees GPU memory from stale KV caches. 0 = no expiry. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1454,6 +1547,7 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["PROMPT_CACHE_TTL"] = str(args.prompt_cache_ttl)
 
     uvicorn.run(
         "mlx_vlm.server:app",
