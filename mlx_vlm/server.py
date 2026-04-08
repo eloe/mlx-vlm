@@ -45,6 +45,12 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 
+def get_default_max_tokens() -> int:
+    """Server-side default max tokens for API responses.
+    Configurable via --default-max-tokens CLI flag or DEFAULT_MAX_TOKENS env var."""
+    return int(os.environ.get("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -554,9 +560,9 @@ class VLMRequest(GenerationParams, TemplateParams):
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
     )
-    max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
-        description="Maximum number of tokens to generate.",
+    max_tokens: Optional[int] = Field(
+        None,
+        description="Maximum number of tokens to generate. Uses server default if not specified.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     resize_shape: Optional[ResizeShapeInput] = Field(
@@ -634,6 +640,10 @@ def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
+    gen_kwargs = request.generation_kwargs()
+    # Apply server-side default max_tokens if not specified in request.
+    if "max_tokens" not in gen_kwargs or gen_kwargs["max_tokens"] is None:
+        gen_kwargs["max_tokens"] = get_default_max_tokens()
     return {
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
@@ -641,7 +651,7 @@ def build_generation_kwargs(
         "kv_quant_scheme": get_kv_quant_scheme(),
         "max_kv_size": get_max_kv_size(request.model),
         "quantized_kv_start": get_quantized_kv_start(),
-        **request.generation_kwargs(),
+        **gen_kwargs,
         **template_kwargs,
     }
 
@@ -1058,6 +1068,9 @@ async def chat_completions_endpoint(request: ChatRequest):
     System message will be ignored if not already in the prompt.
     Can operate in streaming or non-streaming mode.
     """
+    # Resolve default max tokens if not specified in request
+    if request.max_tokens is None:
+        request.max_tokens = get_default_max_tokens()
 
     try:
         # Get model, processor, config - loading if necessary
@@ -1434,6 +1447,13 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--default-max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Default max tokens for API responses when not specified in the request. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1454,6 +1474,7 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["DEFAULT_MAX_TOKENS"] = str(args.default_max_tokens)
 
     uvicorn.run(
         "mlx_vlm.server:app",
