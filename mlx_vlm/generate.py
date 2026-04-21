@@ -3,7 +3,6 @@ import codecs
 import contextlib
 import functools
 import json
-import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -371,7 +370,6 @@ class GenerationResult:
     prompt_tokens: int = 0
     generation_tokens: int = 0
     total_tokens: int = 0
-    cached_tokens: int = 0
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
@@ -388,13 +386,6 @@ class PromptCacheState:
     def __init__(self):
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
-        self.last_used: float = time.time()
-        self.created_at: float = time.time()
-
-    @property
-    def token_count(self) -> int:
-        """Number of tokens stored in the cache."""
-        return len(self.token_ids) if self.token_ids else 0
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
@@ -406,20 +397,10 @@ class PromptCacheState:
                 return i
         return max_len
 
-    def touch(self):
-        """Update last_used timestamp."""
-        self.last_used = time.time()
-
     def update(self, token_ids: list, kv_cache: list):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
-        self.last_used = time.time()
-
-    def invalidate(self):
-        """Discard cached state, forcing a full prefill on next turn."""
-        self.cache = None
-        self.token_ids = None
 
 
 def _speculative_walk(
@@ -1051,65 +1032,33 @@ def stream_generate(
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
 
-    # Save originals for fallback if cache reuse fails
-    _original_input_ids = input_ids
-    _original_pixel_values = pixel_values
-    _original_kwargs = {k: v for k, v in kwargs.items() if k == "cached_image_features"}
-
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
-        try:
-            prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-            cached_total = (
-                len(prompt_cache_state.token_ids) if prompt_cache_state.token_ids else 0
+        prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
+        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
+            reused_prefix_len = prefix_len
+            # Trim to only new tokens
+            input_ids = input_ids[:, prefix_len:]
+            # Only skip vision if no image tokens in the new (trimmed) tokens
+            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
+                model.config, "image_token_index", None
             )
-            # Only reuse if a substantial prefix matches (>= 50% of cached tokens).
-            # Short matches on quantized KV caches (TurboQuant) can produce
-            # corrupted output because trim() only adjusts the offset without
-            # clearing stale quantized data.
-            min_reuse = max(512, cached_total // 2)
-            if prefix_len >= min_reuse and prefix_len < input_ids.shape[1]:
-                reused_prefix_len = prefix_len
-                # Trim to only new tokens
-                input_ids = input_ids[:, prefix_len:]
-                # Only skip vision if no image tokens in the new (trimmed) tokens
-                image_token_id = getattr(
-                    model.config, "image_token_id", None
-                ) or getattr(model.config, "image_token_index", None)
-                new_ids = input_ids.flatten().tolist()
-                has_image_in_new = (
-                    image_token_id is not None and image_token_id in new_ids
-                )
-                if not has_image_in_new:
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
-                # Reuse the saved KV cache (trimmed to prefix length).
-                # Works with both standard KVCache (mx.array keys) and
-                # quantized caches (TurboQuant) via their trim() method.
-                kv_cache = prompt_cache_state.cache
-                for c in kv_cache:
-                    if hasattr(c, "offset") and c.offset > prefix_len:
-                        trim_amount = c.offset - prefix_len
-                        if hasattr(c, "trim") and callable(c.trim):
-                            c.trim(trim_amount)
-                        elif hasattr(c, "keys") and c.keys is not None:
-                            keys = c.keys
-                            if hasattr(keys, "shape") and len(keys.shape) >= 3:
-                                c.keys = keys[:, :, :prefix_len, :]
-                                c.values = c.values[:, :, :prefix_len, :]
-                                c.offset = prefix_len
-                kwargs["prompt_cache"] = kv_cache
-        except Exception as e:
-            # Cache reuse failed (e.g., shape mismatch, stale KV state).
-            # Invalidate and fall back to fresh generation.
-            if os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes"):
-                print(f"[prompt_cache] Cache reuse failed, invalidating: {e}")
-            prompt_cache_state.invalidate()
-            reused_prefix_len = 0
-            input_ids = _original_input_ids
-            pixel_values = _original_pixel_values
-            if "cached_image_features" in _original_kwargs:
-                kwargs["cached_image_features"] = _original_kwargs["cached_image_features"]
-            kwargs.pop("prompt_cache", None)
+            new_ids = input_ids.flatten().tolist()
+            has_image_in_new = image_token_id is not None and image_token_id in new_ids
+            if not has_image_in_new:
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
+            # Reuse the saved KV cache (trimmed to prefix length)
+            kv_cache = prompt_cache_state.cache
+            # Trim cache to prefix_len in case it includes generated tokens
+            for c in kv_cache:
+                if hasattr(c, "keys") and c.keys is not None:
+                    cached_len = c.keys.shape[2]
+                    if cached_len > prefix_len:
+                        c.keys = c.keys[:, :, :prefix_len, :]
+                        c.values = c.values[:, :, :prefix_len, :]
+                        if hasattr(c, "offset"):
+                            c.offset = prefix_len
+            kwargs["prompt_cache"] = kv_cache
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
@@ -1135,35 +1084,6 @@ def stream_generate(
             model.language_model,
             max_kv_size=kwargs.get("max_kv_size", None),
         )
-
-    # Validate cache shapes before generation. If the cached KV state has
-    # inconsistent shapes (e.g., stale after model reload), discard it and
-    # build a fresh cache to avoid broadcast_shapes errors during generation.
-    if reused_prefix_len > 0:
-        try:
-            for c in kwargs["prompt_cache"]:
-                if hasattr(c, "offset"):
-                    # Use offset for all cache types (works for both standard
-                    # KVCache and quantized TurboQuant caches).
-                    if c.offset != reused_prefix_len:
-                        raise ValueError(
-                            f"Cache offset mismatch: expected {reused_prefix_len}, got {c.offset}"
-                        )
-        except (ValueError, IndexError, AttributeError) as e:
-            if os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes"):
-                print(f"[prompt_cache] Cache validation failed, rebuilding: {e}")
-            if prompt_cache_state is not None:
-                prompt_cache_state.invalidate()
-            reused_prefix_len = 0
-            input_ids = _original_input_ids
-            pixel_values = _original_pixel_values
-            if "cached_image_features" in _original_kwargs:
-                kwargs["cached_image_features"] = _original_kwargs["cached_image_features"]
-            kwargs["prompt_cache"] = cache.make_prompt_cache(
-                model.language_model,
-                max_kv_size=kwargs.get("max_kv_size", None),
-            )
-
     tracked_cache = kwargs["prompt_cache"]
 
     total_prompt_tokens = reused_prefix_len + input_ids.size
@@ -1202,7 +1122,6 @@ def stream_generate(
                 prompt_tokens=total_prompt_tokens,
                 generation_tokens=n + 1,
                 total_tokens=total_prompt_tokens + n + 1,
-                cached_tokens=reused_prefix_len,
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
@@ -1216,21 +1135,13 @@ def stream_generate(
             prompt_tokens=total_prompt_tokens,
             generation_tokens=n + 1,
             total_tokens=total_prompt_tokens + n + 1,
-            cached_tokens=reused_prefix_len,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
         )
 
-        # Save cache state for potential reuse on next turn.
-        # Only save if the prompt was substantial (>= 1024 tokens) to avoid
-        # polluting the cache with short probe/capability-check requests that
-        # some agent frameworks send before the real request.
-        _MIN_CACHE_TOKENS = 1024
-        if (
-            prompt_cache_state is not None
-            and len(full_input_ids_list) >= _MIN_CACHE_TOKENS
-        ):
+        # Save cache state for potential reuse on next turn
+        if prompt_cache_state is not None:
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
