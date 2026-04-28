@@ -45,6 +45,11 @@ from .generate import (
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
+from .responses_replay import (
+    resolve_responses_input_items,
+    responses_input_to_messages,
+)
+from .responses_store import ResponseStore
 from .sample_utils import top_p_sampling
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs
@@ -53,6 +58,7 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+_responses_store = ResponseStore()
 
 
 def get_prefill_step_size():
@@ -1196,6 +1202,9 @@ class OpenAIRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    previous_response_id: Optional[str] = Field(
+        None, description="Replay context from a previous response."
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -1568,73 +1577,26 @@ async def responses_endpoint(request: Request):
         model, processor, config = get_cached_model(openai_request.model)
 
         kwargs = {}
-
-        chat_messages = []
-        images = []
-        instructions = None
-        if openai_request.input:
-            if isinstance(openai_request.input, str):
-                # If input is a string, treat it as a single text message
-                chat_messages.append({"role": "user", "content": openai_request.input})
-            elif isinstance(openai_request.input, list):
-                # If input is a list, treat it as a series of chat messages
-                for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
-                        if isinstance(message.content, str):
-                            chat_messages.append(
-                                {"role": message.role, "content": message.content}
-                            )
-                            if message.role == "system":
-                                instructions = message.content
-                        elif isinstance(message.content, list):
-                            # Handle list of content items
-                            for item in message.content:
-                                if isinstance(item, dict):
-                                    if item["type"] == "input_text":
-                                        chat_messages.append(
-                                            {
-                                                "role": message.role,
-                                                "content": item["text"],
-                                            }
-                                        )
-                                        if message.role == "system":
-                                            instructions = item["text"]
-                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
-                                    elif item["type"] == "input_image":
-                                        images.append(item["image_url"])
-                                    else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=400,
-                                            detail="Invalid input item type.",
-                                        )
-                                else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="Missing type in input item.",
-                                    )
-                        else:
-                            print("Invalid message content format.")
-                            raise HTTPException(
-                                status_code=400, detail="Invalid input format."
-                            )
-                    else:
-                        print("not a ChatMessage")
-                        raise HTTPException(
-                            status_code=400, detail="Invalid input format."
-                        )
-            else:
-                print("neither string not list")
-                raise HTTPException(status_code=400, detail="Invalid input format.")
-
-        else:
+        if not openai_request.input:
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
+
+        try:
+            expanded_input = resolve_responses_input_items(
+                openai_request.input,
+                previous_response_id=openai_request.previous_response_id,
+                response_store=_responses_store,
+            )
+            chat_messages, images, instructions = responses_input_to_messages(
+                expanded_input
+            )
+        except LookupError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response not found: {exc.args[0]}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         gen_args = _build_gen_args(openai_request)
 
@@ -1796,6 +1758,9 @@ async def responses_endpoint(request: Request):
                             },
                         }
                     )
+                    _responses_store.save(
+                        response_id, expanded_input, completed_response.output
+                    )
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
@@ -1896,6 +1861,7 @@ async def responses_endpoint(request: Request):
                         "total_tokens": prompt_tokens + output_tokens,
                     },
                 )
+                _responses_store.save(response_id, expanded_input, response.output)
 
                 elapsed = time.perf_counter() - request_start
                 logger.debug(
