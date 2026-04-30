@@ -167,6 +167,10 @@ def test_generation(
         return True
 
 
+test_model_loading.__test__ = False
+test_generation.__test__ = False
+
+
 def main():
     args = parse_args()
 

@@ -102,6 +102,33 @@ def skip_multimodal_module(path: str) -> bool:
     return any(module in path for module in multimodal_modules)
 
 
+def get_class_predicate(
+    skip_vision: bool = False,
+    weights: Optional[dict] = None,
+    quantization: Optional[dict] = None,
+):
+    """Build the module predicate used for model quantization."""
+
+    def predicate(path, module):
+        # Always skip vision and audio models when requested by legacy configs.
+        if skip_multimodal_module(path) and skip_vision:
+            return False
+        # Handle custom per-layer quantizations.
+        if quantization is not None and path in quantization:
+            return quantization[path]
+        if not hasattr(module, "to_quantized"):
+            return False
+        # Skip layers not divisible by 64.
+        if hasattr(module, "weight") and module.weight.size % 64 != 0:
+            return False
+        # Handle legacy models which may not have everything quantized.
+        if weights is not None:
+            return f"{path}.scales" in weights
+        return True
+
+    return predicate
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -302,27 +329,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
 
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
-
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=get_class_predicate(
+                skip_vision=skip_vision,
+                weights=weights,
+                quantization=config["quantization"],
+            ),
         )
 
     if kwargs.get("quantize_activations", False):
@@ -406,9 +422,10 @@ def load(
         ValueError: If model class or args class are not found.
     """
     force_download = kwargs.get("force_download", False)
-    model_path = get_model_path(
-        path_or_hf_repo, force_download=force_download, revision=revision
-    )
+    get_model_path_kwargs = {"revision": revision}
+    if force_download:
+        get_model_path_kwargs["force_download"] = True
+    model_path = get_model_path(path_or_hf_repo, **get_model_path_kwargs)
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
@@ -815,9 +832,10 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
                 raise ValueError("Invalid data URI format - missing comma separator")
             _, data = image_source.split(",", 1)
             image_source = BytesIO(base64.b64decode(data))
-        if isinstance(image_source, str) and image_source.startswith(
+        is_url = isinstance(image_source, str) and image_source.startswith(
             ("http://", "https://")
-        ):
+        )
+        if is_url:
             response = requests.get(image_source, stream=True, timeout=timeout)
             response.raise_for_status()
             image_source = response.raw
@@ -826,6 +844,8 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     except ValueError:
         raise
     except Exception as e:
+        if "is_url" in locals() and is_url:
+            raise ValueError(f"Failed to load image from URL {image_source}: {e}") from e
         raise ValueError(f"Failed to load image from {image_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
@@ -1200,23 +1220,47 @@ def prepare_inputs(
         # Ensure pad_token exists when padding text-only inputs
         if padding and tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        inputs = tokenizer(
-            prompts,
-            add_special_tokens=add_special_tokens,
-            padding=padding,
-            padding_side=padding_side,
-            return_tensors=return_tensors,
-        )
+        if callable(tokenizer):
+            inputs = tokenizer(
+                prompts,
+                add_special_tokens=add_special_tokens,
+                padding=padding,
+                padding_side=padding_side,
+                return_tensors=return_tensors,
+            )
+        else:
+            inputs = process_inputs(
+                processor,
+                prompts=prompts,
+                images=None,
+                audio=None,
+                add_special_tokens=add_special_tokens,
+                padding=padding,
+                padding_side=padding_side,
+                return_tensors=return_tensors,
+                **kwargs,
+            )
         input_ids = (
             inputs.input_ids
-            if isinstance(inputs.input_ids, mx.array)
-            else mx.array(inputs.input_ids)
+            if hasattr(inputs, "input_ids") and isinstance(inputs.input_ids, mx.array)
+            else mx.array(
+                inputs.input_ids if hasattr(inputs, "input_ids") else inputs["input_ids"]
+            )
         )
         mask = (
             inputs.attention_mask
-            if isinstance(inputs.attention_mask, mx.array)
-            else mx.array(inputs.attention_mask)
+            if hasattr(inputs, "attention_mask")
+            and isinstance(inputs.attention_mask, mx.array)
+            else mx.array(
+                inputs.attention_mask
+                if hasattr(inputs, "attention_mask")
+                else inputs["attention_mask"]
+            )
         )
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+        if mask.ndim == 1:
+            mask = mask[None, :]
         return {
             "input_ids": input_ids,
             "attention_mask": mask,

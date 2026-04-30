@@ -9,7 +9,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
@@ -63,6 +63,13 @@ def get_default_enable_thinking():
         "yes",
         "on",
     )
+
+
+def get_max_batch_size():
+    try:
+        return max(0, int(os.environ.get("MLX_VLM_MAX_BATCH_SIZE", 0)))
+    except ValueError:
+        return 0
 
 
 def get_prefill_step_size():
@@ -128,7 +135,7 @@ class GenerationArguments:
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
-    enable_thinking: bool = get_default_enable_thinking()
+    enable_thinking: bool = dataclass_field(default_factory=get_default_enable_thinking)
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
@@ -220,6 +227,7 @@ class ResponseGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
         self.tokenizer = None
+        self.max_batch_size = get_max_batch_size()
         self.requests: Queue = Queue()
         self._stop = False
         self._ready = Event()
@@ -427,7 +435,10 @@ class ResponseGenerator:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
                 new_items = []
-                if active:
+                max_batch_full = (
+                    self.max_batch_size > 0 and len(active) >= self.max_batch_size
+                )
+                if active and not max_batch_full:
                     try:
                         item = self.requests.get_nowait()
                         if item is None:
@@ -437,7 +448,7 @@ class ResponseGenerator:
                             new_items.append(item)
                     except QueueEmpty:
                         pass
-                else:
+                elif not active:
                     try:
                         item = self.requests.get(timeout=0.1)
                         if item is None:
@@ -448,7 +459,9 @@ class ResponseGenerator:
                     except QueueEmpty:
                         pass
 
-                while True:
+                while self.max_batch_size <= 0 or (
+                    len(active) + len(new_items) < self.max_batch_size
+                ):
                     try:
                         item = self.requests.get_nowait()
                         if item is not None:

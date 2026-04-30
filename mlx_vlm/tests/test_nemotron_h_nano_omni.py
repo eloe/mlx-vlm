@@ -1,6 +1,7 @@
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx_lm.models import nemotron_h as nemotron_h_module
 
 from mlx_vlm.models.nemotron_h_nano_omni.audio import (
     SoundEncoder,
@@ -14,7 +15,9 @@ from mlx_vlm.models.nemotron_h_nano_omni.config import (
     TextConfig,
     VisionConfig,
 )
+from mlx_vlm.models.nemotron_h_nano_omni.language import LanguageModel
 from mlx_vlm.models.nemotron_h_nano_omni.nemotron_h_nano_omni import Model
+from mlx_vlm.models.base import scaled_dot_product_attention
 
 
 def tiny_text_config(hidden_size=24):
@@ -160,6 +163,15 @@ def test_model_rejects_sound_token_feature_count_mismatch():
             input_features=mx.random.normal((1, 17, 16)),
             feature_attention_mask=mx.ones((1, 17), dtype=mx.int32),
         )
+
+
+def test_language_model_routes_nemotron_attention_through_vlm_wrapper():
+    assert nemotron_h_module.scaled_dot_product_attention is scaled_dot_product_attention
+
+    model = LanguageModel(tiny_text_config())
+
+    assert nemotron_h_module.scaled_dot_product_attention is scaled_dot_product_attention
+    assert model.layers
 
 
 def test_sanitize_audio_and_projection_weights():

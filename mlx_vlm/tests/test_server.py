@@ -145,6 +145,20 @@ class TestResponseGenerator:
         assert args.enable_thinking is True
         assert args.logit_bias is None
 
+    def test_generate_arguments_default_enable_thinking_env(self, monkeypatch):
+        monkeypatch.setenv("DEFAULT_ENABLE_THINKING", "0")
+
+        args = server.GenerationArguments()
+
+        assert args.enable_thinking is False
+
+    def test_max_batch_size_env(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_MAX_BATCH_SIZE", "1")
+        assert server.get_max_batch_size() == 1
+
+        monkeypatch.setenv("MLX_VLM_MAX_BATCH_SIZE", "bad")
+        assert server.get_max_batch_size() == 0
+
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
         args = server.GenerationArguments(
@@ -215,6 +229,48 @@ class TestResponseGenerator:
         )
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
+        assert args.enable_thinking is True
+
+    def test_build_gen_args_uses_server_thinking_default(self, monkeypatch):
+        monkeypatch.setenv("DEFAULT_ENABLE_THINKING", "0")
+        req = SimpleNamespace(
+            max_tokens=256,
+            max_output_tokens=None,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=None,
+            logit_bias=None,
+            enable_thinking=None,
+            thinking_budget=None,
+            thinking_start_token=None,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is False
+
+    def test_build_gen_args_explicit_thinking_overrides_server_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DEFAULT_ENABLE_THINKING", "0")
+        req = SimpleNamespace(
+            max_tokens=256,
+            max_output_tokens=None,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=None,
+            logit_bias=None,
+            enable_thinking=True,
+            thinking_budget=None,
+            thinking_start_token=None,
+        )
+
+        args = server._build_gen_args(req)
+
         assert args.enable_thinking is True
 
     def test_extract_chat_response_format_json_schema(self):
