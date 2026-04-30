@@ -56,6 +56,15 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 
+def get_default_enable_thinking():
+    return os.environ.get("DEFAULT_ENABLE_THINKING", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -119,7 +128,7 @@ class GenerationArguments:
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
-    enable_thinking: bool = True
+    enable_thinking: bool = get_default_enable_thinking()
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
@@ -837,7 +846,11 @@ def _build_gen_args(request, processor=None) -> GenerationArguments:
         min_p=getattr(request, "min_p", 0.0),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         logit_bias=logit_bias,
-        enable_thinking=getattr(request, "enable_thinking", True),
+        enable_thinking=(
+            get_default_enable_thinking()
+            if getattr(request, "enable_thinking", None) is None
+            else getattr(request, "enable_thinking")
+        ),
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
     )
@@ -1250,7 +1263,9 @@ class OpenAIRequest(FlexibleBaseModel):
     min_p: float = Field(0.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: Optional[bool] = Field(
+        None, description="Enable thinking mode. Defaults to server configuration."
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -1443,7 +1458,9 @@ class VLMRequest(FlexibleBaseModel):
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: Optional[bool] = Field(
+        None, description="Enable thinking mode. Defaults to server configuration."
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."

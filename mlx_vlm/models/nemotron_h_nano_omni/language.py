@@ -2,12 +2,19 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models import nemotron_h as nemotron_h_module
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
-from mlx_lm.models.nemotron_h import Model as NemotronHForCausalLM
-from mlx_lm.models.nemotron_h import ModelArgs, NemotronHModel
 
-from ..base import LanguageModelOutput
+from ..base import (
+    LanguageModelOutput,
+    scaled_dot_product_attention as vlm_scaled_dot_product_attention,
+)
+
+nemotron_h_module.scaled_dot_product_attention = vlm_scaled_dot_product_attention
+ModelArgs = nemotron_h_module.ModelArgs
+NemotronHForCausalLM = nemotron_h_module.Model
+NemotronHModel = nemotron_h_module.NemotronHModel
 
 
 class LanguageModel(nn.Module):
