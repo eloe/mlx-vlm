@@ -9,7 +9,8 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
@@ -54,6 +55,7 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 
 
 def get_default_enable_thinking():
@@ -74,6 +76,21 @@ def get_max_batch_size():
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_token_queue_timeout():
+    raw_timeout = os.environ.get(
+        "MLX_VLM_TOKEN_QUEUE_TIMEOUT", os.environ.get("TOKEN_QUEUE_TIMEOUT", "")
+    )
+    if raw_timeout == "":
+        return DEFAULT_TOKEN_QUEUE_TIMEOUT
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        return DEFAULT_TOKEN_QUEUE_TIMEOUT
+    if timeout <= 0:
+        return None
+    return timeout
 
 
 def get_quantized_kv_bits(model: str):
@@ -400,9 +417,23 @@ class ResponseGenerator:
             # closes immediately after seeing finish_reason isn't treated
             # as a client abort.
             ended = False
+            queue_timeout = get_token_queue_timeout()
             try:
                 while True:
-                    item = rqueue.get(timeout=60.0)
+                    try:
+                        item = rqueue.get(timeout=queue_timeout)
+                    except QueueEmpty as exc:
+                        timeout_label = (
+                            "without a timeout"
+                            if queue_timeout is None
+                            else f"for {queue_timeout:g}s"
+                        )
+                        raise RuntimeError(
+                            "Timed out waiting "
+                            f"{timeout_label} for the next generated token. "
+                            "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
+                            "prefills or reduce the prompt size."
+                        ) from exc
                     if item is None:
                         ended = True
                         break
@@ -624,9 +655,7 @@ class ResponseGenerator:
                     if current_item_index is not None
                     else new_items
                 )
-                active_queue_ids = {
-                    id(info.get("rqueue")) for info in active.values()
-                }
+                active_queue_ids = {id(info.get("rqueue")) for info in active.values()}
                 self._fail_active_requests(active, e, "Generation failed")
                 self._notify_request_queues(
                     [
