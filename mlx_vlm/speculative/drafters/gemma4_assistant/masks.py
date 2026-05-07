@@ -11,6 +11,32 @@ longer than the sliding window.
 from typing import Optional, Tuple, Union
 
 import mlx.core as mx
+from mlx_lm.models.cache import dynamic_roll
+
+
+def normalize_batched_shared_kv_states(
+    shared_kv_states: dict,
+    kv_valid_len: Union[int, mx.array],
+    left_padding: Optional[Union[int, mx.array]] = None,
+) -> dict:
+    """Normalize batched shared K/V into the drafter's prefix-valid layout.
+
+    The target cache may be left-padded (initial batched prefill) and can also
+    carry per-row rollback slack in the tail after mixed speculative accepts.
+    The Gemma drafter expects the simpler invariant used by the unbatched path:
+    each row's real keys occupy ``[0, kv_valid_len)`` and any invalid slots are
+    zeroed in the tail.
+    """
+    if left_padding is None or shared_kv_states is None:
+        return shared_kv_states
+
+    normalized = {}
+    for layer_type, (keys, values) in shared_kv_states.items():
+        normalized[layer_type] = (
+            _normalize_shared_kv_tensor(keys, kv_valid_len, left_padding),
+            _normalize_shared_kv_tensor(values, kv_valid_len, left_padding),
+        )
+    return normalized
 
 
 def bidirectional_full_mask(
@@ -39,7 +65,6 @@ def bidirectional_full_mask(
     inside = k_idx < kv_valid_len[:, None]
     bias = mx.where(inside, mx.array(0.0, dtype=dtype), mx.array(-mx.inf, dtype=dtype))
     return bias[:, None, None, :]
-    return None
 
 
 def bidirectional_swa_mask(
@@ -119,3 +144,52 @@ def make_drafter_masks(
 def _kv_len(kv: Tuple[mx.array, mx.array]) -> int:
     K, _ = kv
     return int(K.shape[-2])
+
+
+def _normalize_shared_kv_tensor(
+    tensor: mx.array,
+    kv_valid_len: Union[int, mx.array],
+    left_padding: Union[int, mx.array],
+) -> mx.array:
+    if tensor.ndim != 4:
+        return tensor
+
+    batch = tensor.shape[0]
+    seq_len = tensor.shape[-2]
+    valid = _broadcast_batch_vector(kv_valid_len, batch, seq_len)
+    left = _broadcast_batch_vector(left_padding, batch, seq_len)
+
+    if batch == 1 and int(left[0].item()) == 0 and int(valid[0].item()) >= seq_len:
+        return tensor
+
+    rolled = dynamic_roll(tensor, -left[:, None], axis=2)
+    keep = mx.arange(seq_len)[None, :] < valid[:, None]
+    keep = keep.astype(tensor.dtype)[:, None, :, None]
+    return rolled * keep
+
+
+def _broadcast_batch_vector(
+    value: Union[int, mx.array],
+    batch: int,
+    limit: int,
+) -> mx.array:
+    if isinstance(value, int):
+        vector = mx.array([value], dtype=mx.int32)
+    elif isinstance(value, mx.array):
+        vector = value.astype(mx.int32)
+    else:
+        vector = mx.array(value, dtype=mx.int32)
+
+    if vector.ndim == 0:
+        vector = vector[None]
+    elif vector.ndim > 1:
+        vector = vector.reshape(-1)
+
+    if vector.shape[0] == 1 and batch != 1:
+        vector = mx.repeat(vector, batch, axis=0)
+    if vector.shape[0] != batch:
+        raise ValueError(
+            f"Expected batch metadata of length {batch}, got {vector.shape[0]}"
+        )
+
+    return mx.clip(vector, 0, limit)

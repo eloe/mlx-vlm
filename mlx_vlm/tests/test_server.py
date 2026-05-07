@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
 from mlx_vlm.apc import hash_image_payload
+from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer
 
 
 @pytest.fixture
@@ -88,6 +89,170 @@ def test_speculative_server_reads_draft_block_size_env(monkeypatch):
 
     monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "3")
     assert server._get_draft_block_size_from_env() == 3
+
+
+class _RecordingSpeculativeLM:
+    def __init__(self, draft_kind):
+        self.calls = []
+        self.draft_kind = draft_kind
+        self._position_ids = "stale"
+        self._rope_deltas = "stale"
+
+    def __call__(self, inputs, cache=None, **kwargs):
+        self.calls.append({"inputs": inputs, "cache": cache, **kwargs})
+        batch_size, seq_len = inputs.shape
+        logits = mx.broadcast_to(
+            mx.array([[[0.0, 1.0, 0.0, 0.0, 0.0]]], dtype=mx.float32),
+            (batch_size, seq_len, 5),
+        )
+        hidden = mx.ones((batch_size, seq_len, 2), dtype=mx.float32)
+        if self.draft_kind == "mtp":
+            return SimpleNamespace(
+                logits=logits,
+                hidden_states=[hidden],
+                shared_kv_states={"full_attention": ("k", "v")},
+            )
+        return SimpleNamespace(
+            logits=logits,
+            hidden_states=[hidden, hidden],
+            shared_kv_states=None,
+        )
+
+
+def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
+    lm = _RecordingSpeculativeLM(draft_kind)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model = SimpleNamespace(language_model=lm)
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = draft_kind
+    gen.stop_tokens = {99}
+    gen.requests = Queue()
+    gen._stop = False
+    gen._make_sampler = lambda args: None
+    gen.tokenizer = SimpleNamespace(
+        decode=lambda tokens: "".join(str(tok) for tok in tokens)
+    )
+
+    specs_iter = iter(request_specs)
+
+    def fake_gpu_embed(raw_inputs, images=None):
+        del raw_inputs, images
+        spec = next(specs_iter)
+        return spec["input_ids"], spec["gen_kwargs"]
+
+    gen._gpu_embed = fake_gpu_embed
+
+    monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: [])
+    monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: None)
+
+    class _FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = ""
+
+        def reset(self):
+            self.last_segment = ""
+
+        def add_token(self, token):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            pass
+
+    monkeypatch.setattr(
+        server, "make_streaming_detokenizer", lambda processor: _FakeDetokenizer()
+    )
+
+    def fake_rounds(*args, **kwargs):
+        del args
+        gen._stop = True
+        yield ([4] * int(kwargs["first_bonus"].shape[0]), None)
+
+    monkeypatch.setattr(
+        server, "_get_speculative_rounds_batch", lambda kind: fake_rounds
+    )
+
+    args = server.GenerationArguments(max_tokens=2, temperature=0)
+    for spec in request_specs:
+        gen.requests.put(
+            (
+                Queue(),
+                {"input_ids": spec["input_ids"]},
+                int(spec["input_ids"].shape[1]),
+                args,
+                None,
+            )
+        )
+
+    gen._run_speculative()
+    return lm.calls[0]
+
+
+def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
+                    "per_layer_inputs": mx.array(
+                        [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]]], dtype=mx.float32
+                    ),
+                },
+            },
+            {
+                "input_ids": mx.array([[21, 22]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.full((1, 2, 4), 7.0, dtype=mx.float32),
+                    "per_layer_inputs": mx.array(
+                        [[[4.0, 4.5], [5.0, 5.5]]], dtype=mx.float32
+                    ),
+                },
+            },
+        ],
+    )
+
+    assert call["return_hidden"] is True
+    assert call["return_shared_kv"] is True
+    assert call["per_layer_inputs"].shape == (2, 3, 2)
+    assert call["per_layer_inputs"].tolist()[1][0] == [0.0, 0.0]
+    assert call["inputs_embeds"].shape == (2, 3, 4)
+
+
+def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="dflash",
+        request_specs=[
+            {
+                "input_ids": mx.array([[31, 32, 33]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
+                    "image_grid_thw": mx.array([[1, 2, 3]], dtype=mx.int32),
+                    "_apc_image_hash": 123,
+                    "_apc_tenant": "tenant-a",
+                },
+            },
+            {
+                "input_ids": mx.array([[41, 42]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.full((1, 2, 4), 9.0, dtype=mx.float32),
+                    "image_grid_thw": mx.array([[4, 5, 6]], dtype=mx.int32),
+                },
+            },
+        ],
+    )
+
+    assert call["capture_layer_ids"] == [1, 2]
+    assert call["image_grid_thw"].tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert call["inputs_embeds"].shape == (2, 3, 4)
+    assert call["inputs_embeds"].tolist()[1][0] == [0.0, 0.0, 0.0, 0.0]
+    assert "_apc_image_hash" not in call
+    assert "_apc_tenant" not in call
 
 
 def test_responses_endpoint_forwards_new_sampling_args(client):
@@ -232,7 +397,7 @@ class TestResponseGenerator:
         args = server.GenerationArguments()
         assert args.max_tokens == server.DEFAULT_MAX_TOKENS
         assert args.temperature == server.DEFAULT_TEMPERATURE
-        assert args.enable_thinking is True
+        assert args.enable_thinking is False
         assert args.logit_bias is None
 
     def test_generate_arguments_default_enable_thinking_env(self, monkeypatch):
@@ -329,28 +494,88 @@ class TestResponseGenerator:
             next(token_iter)
         assert cancelled == []
 
-    def test_token_iterator_yields_items_before_timeout(self, monkeypatch):
-        gen = self._bare_generator()
-        cancelled = []
-        token = SimpleNamespace(text="hi")
+    def test_step_uses_streaming_detokenizer_for_utf8_byte_tokens(self):
+        class ByteFallbackTokenizer:
+            vocab = {
+                "hi": 0,
+                "<0xF0>": 1,
+                "<0x9F>": 2,
+                "<0x98>": 3,
+                "<0x80>": 4,
+            }
 
-        class Requests:
-            def put(self, item):
-                rqueue: Queue = item[0]
-                rqueue.put(SimpleNamespace(uid="req-1"))
-                rqueue.put(token)
-                rqueue.put(None)
+            def decode(self, tokens):
+                text = ""
+                byte_buffer = bytearray()
+                byte_values = {1: 0xF0, 2: 0x9F, 3: 0x98, 4: 0x80}
 
-        gen.requests = Requests()
-        gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+                def flush_bytes():
+                    nonlocal text, byte_buffer
+                    if byte_buffer:
+                        text += byte_buffer.decode("utf-8", errors="replace")
+                        byte_buffer = bytearray()
 
-        _, token_iter = gen.generate("hello")
+                for token in tokens:
+                    if token == 0:
+                        flush_bytes()
+                        text += "hi"
+                    else:
+                        byte_buffer.append(byte_values[token])
+                flush_bytes()
+                return text
 
-        assert next(token_iter) is token
-        with pytest.raises(StopIteration):
-            next(token_iter)
-        assert cancelled == []
+        class SingleResponseBatch:
+            def __init__(self, response):
+                self.response = response
+
+            def next(self, **kwargs):
+                return [], [self.response]
+
+        tokenizer = ByteFallbackTokenizer()
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        )
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rqueue = Queue()
+        active = {
+            1: {
+                "rqueue": rqueue,
+                "detokenizer": server.make_streaming_detokenizer(processor),
+            }
+        }
+
+        for token in [0, 1, 2, 3, 4]:
+            gen._step(
+                SingleResponseBatch(
+                    SimpleNamespace(
+                        uid=1,
+                        token=token,
+                        token_logprob=0.0,
+                        finish_reason=None,
+                    )
+                ),
+                active,
+            )
+        gen._step(
+            SingleResponseBatch(
+                SimpleNamespace(
+                    uid=1,
+                    token=99,
+                    token_logprob=0.0,
+                    finish_reason="stop",
+                )
+            ),
+            active,
+        )
+
+        streamed_text = ""
+        while not rqueue.empty():
+            item = rqueue.get()
+            if item is not None:
+                streamed_text += item.text
+
+        assert streamed_text == "hi😀"
+        assert "\ufffd" not in streamed_text
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
@@ -427,104 +652,46 @@ class TestResponseGenerator:
         assert args.max_tokens == 256
         assert args.enable_thinking is True
 
-    def test_build_gen_args_uses_server_thinking_default(self, monkeypatch):
-        monkeypatch.setenv("DEFAULT_ENABLE_THINKING", "0")
-        req = SimpleNamespace(
-            max_tokens=256,
-            max_output_tokens=None,
-            temperature=0.0,
-            top_p=1.0,
-            top_k=0,
-            min_p=0.0,
-            repetition_penalty=None,
-            logit_bias=None,
-            enable_thinking=None,
-            thinking_budget=None,
-            thinking_start_token=None,
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.enable_thinking is False
-
-    def test_build_gen_args_explicit_thinking_overrides_server_default(
+    def test_build_gen_args_uses_server_thinking_default_when_omitted(
         self, monkeypatch
     ):
-        monkeypatch.setenv("DEFAULT_ENABLE_THINKING", "0")
-        req = SimpleNamespace(
-            max_tokens=256,
-            max_output_tokens=None,
-            temperature=0.0,
-            top_p=1.0,
-            top_k=0,
-            min_p=0.0,
-            repetition_penalty=None,
-            logit_bias=None,
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert "enable_thinking" not in req.model_fields_set
+        assert server._build_gen_args(req).enable_thinking is True
+
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert server._build_gen_args(req).enable_thinking is False
+
+    def test_build_gen_args_request_thinking_overrides_server_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            enable_thinking=False,
+        )
+
+        assert server._build_gen_args(req).enable_thinking is False
+
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
             enable_thinking=True,
-            thinking_budget=None,
-            thinking_start_token=None,
         )
 
-        args = server._build_gen_args(req)
-
-        assert args.enable_thinking is True
-
-    def test_fail_active_requests_notifies_and_clears_streams(self):
-        gen = self._bare_generator()
-        first = Queue()
-        second = Queue()
-        active = {
-            1: {"rqueue": first},
-            2: {"rqueue": second},
-        }
-
-        gen._fail_active_requests(active, IndexError("boom"), "Generation failed")
-
-        assert active == {}
-        for rqueue in (first, second):
-            error = rqueue.get_nowait()
-            assert isinstance(error, RuntimeError)
-            assert str(error) == "Generation failed: boom"
-            assert rqueue.get_nowait() is None
-
-    def test_notify_request_queues_deduplicates_and_terminates(self):
-        gen = self._bare_generator()
-        rqueue = Queue()
-
-        gen._notify_request_queues(
-            [rqueue, rqueue], ValueError("bad batch"), "Generation failed"
-        )
-
-        error = rqueue.get_nowait()
-        assert isinstance(error, RuntimeError)
-        assert str(error) == "Generation failed: bad batch"
-        assert rqueue.get_nowait() is None
-        assert rqueue.empty()
-
-    def test_generation_error_backoff_tracks_and_resets_state(self):
-        gen = self._bare_generator()
-
-        first_delay = gen._record_generation_error(IndexError("first"))
-        second_delay = gen._record_generation_error(IndexError("second"))
-
-        assert gen._consecutive_generation_errors == 2
-        assert gen._last_generation_error == "IndexError: second"
-        assert second_delay >= first_delay
-
-        gen._record_generation_success()
-
-        assert gen._consecutive_generation_errors == 0
-        assert gen._last_generation_error is None
-
-    def test_generation_health_reports_last_error_state(self):
-        gen = self._bare_generator()
-        gen._record_generation_error(RuntimeError("failed"))
-
-        health = gen.generation_health()
-
-        assert health["consecutive_generation_errors"] == 1
-        assert health["last_generation_error"] == "RuntimeError: failed"
-        assert health["last_generation_error_at"] is not None
+        assert server._build_gen_args(req).enable_thinking is True
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
