@@ -384,7 +384,10 @@ class TestResponseGenerator:
 
     def _bare_generator(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
->>>>>>> upstream/main
+        gen._consecutive_generation_errors = 0
+        gen._last_generation_error = None
+        gen._last_generation_error_at = 0.0
+        gen._stop = False
         gen.draft_model = None
         gen.wait_until_ready = lambda: None
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
@@ -397,8 +400,23 @@ class TestResponseGenerator:
         assert args.enable_thinking is False
         assert args.logit_bias is None
 
+    def test_generate_arguments_default_enable_thinking_env(self, monkeypatch):
+        monkeypatch.setenv("DEFAULT_ENABLE_THINKING", "0")
+
+        args = server.GenerationArguments()
+
+        assert args.enable_thinking is False
+
+    def test_max_batch_size_env(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_MAX_BATCH_SIZE", "1")
+        assert server.get_max_batch_size() == 1
+
+        monkeypatch.setenv("MLX_VLM_MAX_BATCH_SIZE", "bad")
+        assert server.get_max_batch_size() == 0
+
     def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.delenv("TOKEN_QUEUE_TIMEOUT", raising=False)
 
         assert server.get_token_queue_timeout() == 600.0
 
@@ -406,6 +424,12 @@ class TestResponseGenerator:
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "42.5")
 
         assert server.get_token_queue_timeout() == 42.5
+
+    def test_token_queue_timeout_accepts_legacy_env_alias(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setenv("TOKEN_QUEUE_TIMEOUT", "90")
+
+        assert server.get_token_queue_timeout() == 90.0
 
     def test_token_queue_timeout_invalid_values_fall_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "bad")
@@ -466,6 +490,29 @@ class TestResponseGenerator:
         start = time.monotonic()
         assert next(token_iter) is token
         assert time.monotonic() - start >= delay_s * 0.5
+        with pytest.raises(StopIteration):
+            next(token_iter)
+        assert cancelled == []
+
+    def test_token_iterator_yields_items_before_timeout(self, monkeypatch):
+        gen = self._bare_generator()
+        cancelled = []
+        token = SimpleNamespace(text="hi")
+
+        class Requests:
+            def put(self, item):
+                rqueue: Queue = item[0]
+                rqueue.put(SimpleNamespace(uid="req-1"))
+                rqueue.put(token)
+                rqueue.put(None)
+
+        gen.requests = Requests()
+        gen._cancel = cancelled.append
+        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+
+        _, token_iter = gen.generate("hello")
+
+        assert next(token_iter) is token
         with pytest.raises(StopIteration):
             next(token_iter)
         assert cancelled == []
@@ -628,7 +675,27 @@ class TestResponseGenerator:
         assert args.max_tokens == 256
         assert args.enable_thinking is True
 
-    def test_build_gen_args_uses_server_thinking_default_when_omitted(
+    def test_build_gen_args_uses_server_thinking_default(self, monkeypatch):
+        monkeypatch.setenv("DEFAULT_ENABLE_THINKING", "0")
+        req = SimpleNamespace(
+            max_tokens=256,
+            max_output_tokens=None,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=None,
+            logit_bias=None,
+            enable_thinking=None,
+            thinking_budget=None,
+            thinking_start_token=None,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is False
+
+    def test_build_gen_args_explicit_thinking_overrides_server_default(
         self, monkeypatch
     ):
         monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
@@ -668,6 +735,65 @@ class TestResponseGenerator:
         )
 
         assert server._build_gen_args(req).enable_thinking is True
+
+        assert args.enable_thinking is True
+
+    def test_fail_active_requests_notifies_and_clears_streams(self):
+        gen = self._bare_generator()
+        first = Queue()
+        second = Queue()
+        active = {
+            1: {"rqueue": first},
+            2: {"rqueue": second},
+        }
+
+        gen._fail_active_requests(active, IndexError("boom"), "Generation failed")
+
+        assert active == {}
+        for rqueue in (first, second):
+            error = rqueue.get_nowait()
+            assert isinstance(error, RuntimeError)
+            assert str(error) == "Generation failed: boom"
+            assert rqueue.get_nowait() is None
+
+    def test_notify_request_queues_deduplicates_and_terminates(self):
+        gen = self._bare_generator()
+        rqueue = Queue()
+
+        gen._notify_request_queues(
+            [rqueue, rqueue], ValueError("bad batch"), "Generation failed"
+        )
+
+        error = rqueue.get_nowait()
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "Generation failed: bad batch"
+        assert rqueue.get_nowait() is None
+        assert rqueue.empty()
+
+    def test_generation_error_backoff_tracks_and_resets_state(self):
+        gen = self._bare_generator()
+
+        first_delay = gen._record_generation_error(IndexError("first"))
+        second_delay = gen._record_generation_error(IndexError("second"))
+
+        assert gen._consecutive_generation_errors == 2
+        assert gen._last_generation_error == "IndexError: second"
+        assert second_delay >= first_delay
+
+        gen._record_generation_success()
+
+        assert gen._consecutive_generation_errors == 0
+        assert gen._last_generation_error is None
+
+    def test_generation_health_reports_last_error_state(self):
+        gen = self._bare_generator()
+        gen._record_generation_error(RuntimeError("failed"))
+
+        health = gen.generation_health()
+
+        assert health["consecutive_generation_errors"] == 1
+        assert health["last_generation_error"] == "RuntimeError: failed"
+        assert health["last_generation_error_at"] is not None
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:

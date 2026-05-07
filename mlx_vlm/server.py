@@ -63,6 +63,22 @@ DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_ENABLE_THINKING = False
 
 
+def get_default_enable_thinking():
+    return os.environ.get("DEFAULT_ENABLE_THINKING", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def get_max_batch_size():
+    try:
+        return max(0, int(os.environ.get("MLX_VLM_MAX_BATCH_SIZE", 0)))
+    except ValueError:
+        return 0
+
+
 def _get_speculative_rounds_batch(draft_kind: str):
     if draft_kind == "mtp":
         return _mtp_rounds_batch
@@ -101,7 +117,9 @@ def get_server_max_tokens():
 
 
 def get_token_queue_timeout():
-    raw_timeout = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
+    raw_timeout = os.environ.get(
+        "MLX_VLM_TOKEN_QUEUE_TIMEOUT", os.environ.get("TOKEN_QUEUE_TIMEOUT", "")
+    )
     if raw_timeout == "":
         return DEFAULT_TOKEN_QUEUE_TIMEOUT
     try:
@@ -704,7 +722,11 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
->>>>>>> upstream/main
+                    if has_embeds:
+                        self._step(batch_gen, active)
+
+                current_item_index = len(new_items)
+
                 if not active or batch_gen is None:
                     continue
 
@@ -712,17 +734,26 @@ class ResponseGenerator:
                 self._record_generation_success()
 
             except Exception as e:
-                logger.exception("Error in generation thread")
-                for info in list(active.values()):
-                    try:
-                        info["rqueue"].put(e)
-                        info["rqueue"].put(None)
-                    except Exception:
-                        pass
-                active.clear()
+                print(f"Error in generation thread: {e}")
+                traceback.print_exc()
+                pending_items = (
+                    new_items[current_item_index:]
+                    if current_item_index is not None
+                    else new_items
+                )
+                active_queue_ids = {id(info.get("rqueue")) for info in active.values()}
+                self._fail_active_requests(active, e, "Generation failed")
+                self._notify_request_queues(
+                    [
+                        item[0]
+                        for item in pending_items
+                        if id(item[0]) not in active_queue_ids
+                    ],
+                    e,
+                    "Generation failed before request activation",
+                )
                 batch_gen = None
-                mx.clear_cache()
-                gc.collect()
+                self._cleanup_after_generation_error(e, "Generation thread error")
 
     def _run_speculative(self):
         """GPU thread loop with DFlash or Gemma 4 MTP speculative decoding.
@@ -2922,6 +2953,11 @@ async def health_check():
     """
     Check if the server is healthy and what model is loaded.
     """
+    generation = (
+        response_generator.generation_health()
+        if response_generator is not None
+        else None
+    )
     config = model_cache.get("config")
     text_config = getattr(config, "text_config", None)
 
@@ -2936,6 +2972,7 @@ async def health_check():
             else None
         ),
         "continuous_batching_enabled": response_generator is not None,
+        "generation": generation,
         "apc_enabled": apc_manager is not None,
     }
 
