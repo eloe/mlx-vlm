@@ -160,6 +160,7 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
+            chat_template=getattr(tokenizer, "chat_template", None),
             **proc_kwargs,
         )
 
