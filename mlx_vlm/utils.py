@@ -850,7 +850,8 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
             image_source = BytesIO(base64.b64decode(data))
         is_url = isinstance(image_source, str) and image_source.startswith(
             ("http://", "https://")
-        ):
+        )
+        if is_url:
             with requests.get(image_source, stream=True, timeout=timeout) as response:
                 response.raise_for_status()
                 image_source = BytesIO(response.content)

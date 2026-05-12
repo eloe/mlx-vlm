@@ -8,6 +8,7 @@ import re
 import time
 import traceback
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -40,18 +41,22 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _dflash_rounds_batch,
     _make_cache,
     _merge_prefill_prompt_kwargs,
-    _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
     stream_generate,
 )
-from .prompt_utils import apply_chat_template
+from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
+from .speculative.utils import (
+    make_speculative_prompt_cache,
+    run_speculative_server_rounds,
+    speculative_hidden_state,
+    speculative_prefill_kwargs,
+)
 from .structured import build_json_schema_logits_processor
-from .tokenizer_utils import make_streaming_detokenizer
+from .tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
@@ -60,7 +65,10 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
+METRICS_HISTORY_LIMIT = 100
+METRICS_RECENT_LIMIT = 32
 
 
 def get_default_enable_thinking():
@@ -79,28 +87,8 @@ def get_max_batch_size():
         return 0
 
 
-def _get_speculative_rounds_batch(draft_kind: str):
-    if draft_kind == "mtp":
-        return _mtp_rounds_batch
-    if draft_kind == "dflash":
-        return _dflash_rounds_batch
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
-
-
-def _speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
-    if draft_kind == "mtp":
-        return {"return_hidden": True, "return_shared_kv": True}
-    if draft_kind == "dflash":
-        return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
-
-
-def _speculative_hidden_state(draft_kind: str, outputs):
-    if draft_kind == "mtp":
-        return outputs.hidden_states[-1]
-    if draft_kind == "dflash":
-        return mx.concatenate(outputs.hidden_states, axis=-1)
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+class PromptTooLongError(ValueError):
+    """Raised when a request exceeds the configured server context budget."""
 
 
 def _get_draft_block_size_from_env():
@@ -134,6 +122,16 @@ def get_token_queue_timeout():
     if timeout <= 0:
         return None
     return timeout
+
+
+def get_speculative_batch_coalesce_s():
+    raw = os.environ.get(
+        "MLX_VLM_SPEC_BATCH_COALESCE_MS", str(DEFAULT_SPECULATIVE_BATCH_COALESCE_MS)
+    )
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
 def get_server_enable_thinking():
@@ -171,6 +169,28 @@ def get_max_kv_size(model: str):
     return max_kv_tokens
 
 
+def get_configured_context_limit():
+    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
+    return max_kv_tokens or None
+
+
+def _count_prompt_tokens(raw_inputs: dict) -> int:
+    input_ids = raw_inputs["input_ids"]
+    return input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+
+
+def _check_configured_context_budget(prompt_tokens: int, max_tokens: int):
+    context_limit = get_configured_context_limit()
+    requested_tokens = prompt_tokens + max(0, int(max_tokens or 0))
+    if context_limit is not None and requested_tokens > context_limit:
+        raise PromptTooLongError(
+            "Request needs "
+            f"{requested_tokens} context tokens "
+            f"({prompt_tokens} prompt + {max_tokens} max generation), "
+            f"but MAX_KV_SIZE is {context_limit}."
+        )
+
+
 def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
@@ -194,6 +214,264 @@ GENERATION_ERROR_BACKOFF_MAX_SECONDS = float(
 GENERATION_ERROR_RESET_WINDOW_SECONDS = float(
     os.environ.get("MLX_VLM_GENERATION_ERROR_RESET_WINDOW_SECONDS", 30.0)
 )
+def _token_window_rate(token_times: List[float], window: int) -> Optional[float]:
+    if len(token_times) < 2:
+        return None
+    subset = token_times[-window:]
+    if len(subset) < 2:
+        return None
+    elapsed = subset[-1] - subset[0]
+    if elapsed <= 0:
+        return None
+    return (len(subset) - 1) / elapsed
+
+
+def _token_window_rate_first(token_times: List[float], window: int) -> Optional[float]:
+    if len(token_times) < 2:
+        return None
+    subset = token_times[:window]
+    if len(subset) < 2:
+        return None
+    elapsed = subset[-1] - subset[0]
+    if elapsed <= 0:
+        return None
+    return (len(subset) - 1) / elapsed
+
+
+class ServerMetricsStore:
+    """Rolling request metrics and lifetime counters for the server."""
+
+    def __init__(self, history_limit: int = METRICS_HISTORY_LIMIT):
+        self.history_limit = history_limit
+        self.reset()
+
+    def reset(self):
+        self.started_at = time.time()
+        self._lock = Lock()
+        self._latest: Optional[dict] = None
+        self._recent = deque(maxlen=self.history_limit)
+        self._requests_started = 0
+        self._requests_completed = 0
+        self._requests_failed = 0
+        self._streaming_requests = 0
+        self._in_flight = 0
+        self._prompt_tokens_total = 0
+        self._completion_tokens_total = 0
+        self._generated_tokens_total = 0
+        self._request_time_total_s = 0.0
+        self._decode_time_total_s = 0.0
+        self._last_request_at: Optional[float] = None
+        self._last_error: Optional[dict] = None
+
+    def begin_request(self, *, endpoint: str, model: str, stream: bool):
+        del endpoint, model
+        with self._lock:
+            self._requests_started += 1
+            self._in_flight += 1
+            if stream:
+                self._streaming_requests += 1
+
+    def record_success(self, envelope: dict):
+        payload = dict(envelope)
+        with self._lock:
+            self._requests_completed += 1
+            self._in_flight = max(0, self._in_flight - 1)
+            self._latest = payload
+            self._recent.append(payload)
+            self._last_request_at = payload.get("timestamp_unix")
+            self._prompt_tokens_total += int(payload.get("prompt_tokens") or 0)
+            self._completion_tokens_total += int(payload.get("completion_tokens") or 0)
+            self._generated_tokens_total += int(payload.get("generated_tokens") or 0)
+            self._request_time_total_s += float(payload.get("request_elapsed_s") or 0.0)
+            self._decode_time_total_s += float(payload.get("decode_elapsed_s") or 0.0)
+
+    def record_failure(self, *, endpoint: str, model: str, stream: bool, error: str):
+        with self._lock:
+            self._requests_failed += 1
+            self._in_flight = max(0, self._in_flight - 1)
+            self._last_request_at = time.time()
+            self._last_error = {
+                "timestamp_unix": self._last_request_at,
+                "endpoint": endpoint,
+                "model": model,
+                "stream": bool(stream),
+                "error": error,
+            }
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            latest = dict(self._latest) if self._latest is not None else None
+            recent = [dict(item) for item in list(self._recent)[-METRICS_RECENT_LIMIT:]]
+            requests_completed = self._requests_completed
+            avg_request_time = (
+                self._request_time_total_s / requests_completed
+                if requests_completed > 0
+                else 0.0
+            )
+            avg_request_tok_s = (
+                self._completion_tokens_total / self._request_time_total_s
+                if self._request_time_total_s > 0
+                else 0.0
+            )
+            avg_decode_tok_s = (
+                self._generated_tokens_total / self._decode_time_total_s
+                if self._decode_time_total_s > 0
+                else 0.0
+            )
+            last_error = (
+                dict(self._last_error) if self._last_error is not None else None
+            )
+            last_request_at = self._last_request_at
+            return {
+                "latest": latest,
+                "recent": recent,
+                "summary": {
+                    "uptime_s": max(0.0, time.time() - self.started_at),
+                    "requests_started": self._requests_started,
+                    "requests_completed": requests_completed,
+                    "requests_failed": self._requests_failed,
+                    "streaming_requests": self._streaming_requests,
+                    "in_flight": self._in_flight,
+                    "prompt_tokens_total": self._prompt_tokens_total,
+                    "completion_tokens_total": self._completion_tokens_total,
+                    "generated_tokens_total": self._generated_tokens_total,
+                    "avg_request_time_s": avg_request_time,
+                    "avg_request_tok_s": avg_request_tok_s,
+                    "avg_decode_tok_s": avg_decode_tok_s,
+                    "last_request_at": last_request_at,
+                    "last_error": last_error,
+                },
+            }
+
+
+def _prompt_eval_time_from_tps(
+    prompt_tokens: int, prompt_tps: Optional[float]
+) -> Optional[float]:
+    if prompt_tokens <= 0 or prompt_tps is None or prompt_tps <= 0:
+        return None
+    return prompt_tokens / prompt_tps
+
+
+def _decode_elapsed_from_metrics(
+    token_times: List[float],
+    generated_tokens: int,
+    generation_tps: Optional[float],
+) -> Optional[float]:
+    if len(token_times) >= 2:
+        elapsed = token_times[-1] - token_times[0]
+        if elapsed > 0:
+            return elapsed
+    if generated_tokens > 0 and generation_tps is not None and generation_tps > 0:
+        return generated_tokens / generation_tps
+    return None
+
+
+def _build_metrics_envelope(
+    *,
+    endpoint: str,
+    model: str,
+    stream: bool,
+    backend: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    generated_tokens: int,
+    request_elapsed_s: float,
+    request_started_s: float,
+    token_times: Optional[List[float]] = None,
+    prompt_tps: Optional[float] = None,
+    generation_tps: Optional[float] = None,
+    peak_memory_gb: Optional[float] = None,
+    finish_reason: Optional[str] = None,
+    image_count: int = 0,
+    audio_count: int = 0,
+    structured_output: bool = False,
+    thinking_enabled: bool = False,
+    tool_parser: Optional[str] = None,
+    tool_calls: bool = False,
+) -> dict:
+    token_times = token_times or []
+    ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
+    decode_elapsed_s = _decode_elapsed_from_metrics(
+        token_times, generated_tokens, generation_tps
+    )
+    decode_tok_s = None
+    if generation_tps is not None and generation_tps > 0:
+        decode_tok_s = generation_tps
+    elif decode_elapsed_s is not None and decode_elapsed_s > 0 and generated_tokens > 0:
+        decode_tok_s = generated_tokens / decode_elapsed_s
+    prompt_eval_time_s = _prompt_eval_time_from_tps(prompt_tokens, prompt_tps)
+    request_tok_s = (
+        completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
+    )
+    return {
+        "timestamp_unix": time.time(),
+        "endpoint": endpoint,
+        "model": model,
+        "stream": bool(stream),
+        "backend": backend,
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+        "generated_tokens": int(generated_tokens),
+        "reasoning_tokens": max(0, int(generated_tokens) - int(completion_tokens)),
+        "total_tokens": int(prompt_tokens) + int(completion_tokens),
+        "prompt_eval_time_s": prompt_eval_time_s,
+        "prefill_tok_s": prompt_tps,
+        "ttft_s": ttft_s,
+        "decode_elapsed_s": decode_elapsed_s,
+        "request_elapsed_s": request_elapsed_s,
+        "request_tok_s": request_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "sliding_decode_tok_s_first_32": _token_window_rate_first(token_times, 32),
+        "sliding_decode_tok_s_first_64": _token_window_rate_first(token_times, 64),
+        "sliding_decode_tok_s_last_32": _token_window_rate(token_times, 32),
+        "sliding_decode_tok_s_last_64": _token_window_rate(token_times, 64),
+        "peak_memory_gb": peak_memory_gb,
+        "finish_reason": finish_reason,
+        "image_count": int(image_count),
+        "audio_count": int(audio_count),
+        "structured_output": bool(structured_output),
+        "thinking_enabled": bool(thinking_enabled),
+        "tool_parser": tool_parser,
+        "tool_calls": bool(tool_calls),
+        "apc_enabled": apc_manager is not None,
+    }
+
+
+def _server_runtime_snapshot() -> dict:
+    config = model_cache.get("config")
+    text_config = getattr(config, "text_config", None)
+    native_context_size = getattr(text_config, "max_position_embeddings", None)
+    configured_context_limit = get_configured_context_limit()
+    effective_context_limit = (
+        min(native_context_size, configured_context_limit)
+        if native_context_size is not None and configured_context_limit is not None
+        else configured_context_limit or native_context_size
+    )
+    queue_depth = 0
+    if response_generator is not None and hasattr(response_generator, "requests"):
+        try:
+            queue_depth = response_generator.requests.qsize()
+        except Exception:
+            queue_depth = 0
+    return {
+        "loaded_model": model_cache.get("model_path", None),
+        "loaded_adapter": model_cache.get("adapter_path", None),
+        "loaded_context_size": native_context_size,
+        "configured_context_limit": configured_context_limit,
+        "effective_context_limit": effective_context_limit,
+        "loaded_tool_parser": (
+            _infer_tool_parser_from_processor(model_cache.get("processor"))
+            if model_cache.get("processor")
+            else None
+        ),
+        "continuous_batching_enabled": response_generator is not None,
+        "request_queue_depth": queue_depth,
+        "apc": (
+            {"enabled": False}
+            if apc_manager is None
+            else {"enabled": True, **apc_manager.stats_snapshot()}
+        ),
+    }
 
 
 # =============================================================================
@@ -273,6 +551,7 @@ class StreamingToken:
     logprobs: float
     finish_reason: Optional[str]
     peak_memory: float = 0.0
+    prompt_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
 
 
@@ -467,11 +746,8 @@ class ResponseGenerator:
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
         raw_inputs = self._cpu_preprocess(prompt, images, audio)
-        prompt_tokens = (
-            raw_inputs["input_ids"].size
-            if hasattr(raw_inputs["input_ids"], "size")
-            else len(raw_inputs["input_ids"])
-        )
+        prompt_tokens = _count_prompt_tokens(raw_inputs)
+        _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
@@ -587,6 +863,44 @@ class ResponseGenerator:
             )
         return input_ids, gen_kwargs
 
+    def _collect_pending_requests(
+        self,
+        *,
+        active: bool,
+        idle_timeout: float = 0.1,
+        coalesce_s: float = 0.0,
+    ):
+        """Collect the first queued request, then drain immediately available peers."""
+        pending = []
+        should_stop = False
+
+        def append_item(item):
+            nonlocal should_stop
+            if item is None:
+                if self._stop and not pending:
+                    should_stop = True
+                return
+            pending.append(item)
+
+        try:
+            if active:
+                append_item(self.requests.get_nowait())
+            else:
+                append_item(self.requests.get(timeout=idle_timeout))
+        except QueueEmpty:
+            pass
+
+        if pending and coalesce_s > 0:
+            time.sleep(coalesce_s)
+
+        while not should_stop:
+            try:
+                append_item(self.requests.get_nowait())
+            except QueueEmpty:
+                break
+
+        return pending, should_stop
+
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         try:
@@ -616,39 +930,11 @@ class ResponseGenerator:
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
-                max_batch_full = (
-                    self.max_batch_size > 0 and len(active) >= self.max_batch_size
+                new_items, should_stop = self._collect_pending_requests(
+                    active=bool(active)
                 )
-                if active and not max_batch_full:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is None:
-                            if self._stop:
-                                break
-                        else:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        pass
-                elif not active:
-                    try:
-                        item = self.requests.get(timeout=0.1)
-                        if item is None:
-                            if self._stop:
-                                break
-                        else:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        pass
-
-                while self.max_batch_size <= 0 or (
-                    len(active) + len(new_items) < self.max_batch_size
-                ):
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is not None:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        break
+                if should_stop:
+                    break
 
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
@@ -718,8 +1004,12 @@ class ResponseGenerator:
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     active[uid] = {
                         "rqueue": rqueue,
-                        "detokenizer": make_streaming_detokenizer(self.processor),
+                        "streamer": _ServerTokenStreamer(
+                            self.tokenizer,
+                            make_streaming_detokenizer(self.processor),
+                        ),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
+                        "prompt_tps": None,
                     }
 
                     if has_embeds:
@@ -772,8 +1062,7 @@ class ResponseGenerator:
         drafter = self.draft_model
         draft_kind = self.draft_kind
         is_mtp = draft_kind == "mtp"
-        rounds_batch = _get_speculative_rounds_batch(draft_kind)
-        prefill_kwargs = _speculative_prefill_kwargs(draft_kind, drafter)
+        prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
@@ -783,31 +1072,22 @@ class ResponseGenerator:
             rqueues = {}
             try:
                 # --- Phase 1: collect pending requests ---
-                timeout = 0.1
-                try:
-                    item = self.requests.get(timeout=timeout)
-                    if item is None and self._stop:
-                        break
-                    if item is not None:
-                        pending.append(item)
-                except QueueEmpty:
-                    pass
-                while True:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is not None:
-                            pending.append(item)
-                    except QueueEmpty:
-                        break
+                pending, should_stop = self._collect_pending_requests(
+                    active=False,
+                    coalesce_s=get_speculative_batch_coalesce_s(),
+                )
+                if should_stop:
+                    break
 
                 if not pending:
                     continue
-
                 # --- Phase 2: prefill new batch ---
                 uids = []
                 token_lists = {}
                 stream_infos = {}
                 max_tokens_map = {}
+                prompt_tokens_map = {}
+                prompt_tps_map = {}
                 all_input_ids = []
                 prompt_kwargs_list = []
 
@@ -823,9 +1103,13 @@ class ResponseGenerator:
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
                     stream_infos[uid] = {
-                        "detokenizer": make_streaming_detokenizer(self.processor)
+                        "streamer": _ServerTokenStreamer(
+                            self.tokenizer,
+                            make_streaming_detokenizer(self.processor),
+                        )
                     }
                     max_tokens_map[uid] = args.max_tokens
+                    prompt_tokens_map[uid] = prompt_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -843,17 +1127,32 @@ class ResponseGenerator:
                     prompt_kwargs_list, all_input_ids
                 )
 
-                prompt_cache = _make_cache(lm, left_padding)
+                prompt_cache = make_speculative_prompt_cache(
+                    lm,
+                    draft_kind=draft_kind,
+                    batch_size=B,
+                    left_padding=left_padding,
+                    make_cache=_make_cache,
+                )
 
                 lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
                 lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
 
+                prompt_started = time.perf_counter()
                 with mx.stream(generation_stream):
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
-                hidden = _speculative_hidden_state(draft_kind, out)
+                hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
+                prompt_elapsed = time.perf_counter() - prompt_started
+                for uid in uids:
+                    prompt_tokens = prompt_tokens_map[uid]
+                    prompt_tps_map[uid] = (
+                        prompt_tokens / prompt_elapsed
+                        if prompt_tokens > 0 and prompt_elapsed > 0
+                        else None
+                    )
 
                 finished_uids = set()
 
@@ -873,6 +1172,7 @@ class ResponseGenerator:
                             logprobs=0.0,
                             finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9,
+                            prompt_tps=prompt_tps_map.get(uid),
                         )
                     )
                     if finish is not None:
@@ -895,32 +1195,25 @@ class ResponseGenerator:
                         return True
                     return False
 
-                rounds_kwargs = dict(
+                rounds_iter = run_speculative_server_rounds(
+                    self.model,
+                    drafter,
+                    prompt_cache,
+                    hidden,
+                    draft_kind=draft_kind,
                     first_bonus=first_bonus,
                     max_tokens=max_tok,
                     sampler=sampler,
                     draft_block_size=draft_block_size,
                     token_dtype=mx.int32,
                     stop_check=stop_check,
+                    greedy_sampling=all(
+                        pending_args.temperature == 0
+                        for _, _, _, pending_args, _ in pending
+                    ),
+                    shared_kv_states=shared_kv_states,
+                    eos_token_ids=eos_set,
                 )
-                if is_mtp:
-                    rounds_iter = rounds_batch(
-                        self.model,
-                        drafter,
-                        prompt_cache,
-                        hidden,
-                        shared_kv_states,
-                        eos_token_ids=eos_set,
-                        **rounds_kwargs,
-                    )
-                else:
-                    rounds_iter = rounds_batch(
-                        self.model,
-                        drafter,
-                        prompt_cache,
-                        hidden,
-                        **rounds_kwargs,
-                    )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
                         if tok is None:
@@ -944,12 +1237,15 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason=finish,
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                prompt_tps=prompt_tps_map.get(uid),
                             )
                         )
 
                         if finish is not None:
                             rqueues[uid].put(None)
                             finished_uids.add(uid)
+                    if len(finished_uids) == len(uids):
+                        break
 
                 # Log acceptance stats
                 al = drafter.accept_lens
@@ -964,8 +1260,7 @@ class ResponseGenerator:
                 # Finalize any remaining
                 for uid in uids:
                     if uid not in finished_uids:
-                        stream_infos[uid]["detokenizer"].finalize()
-                        text = stream_infos[uid]["detokenizer"].last_segment
+                        text = stream_infos[uid]["streamer"].finalize()
                         rqueues[uid].put(
                             StreamingToken(
                                 text=text,
@@ -973,6 +1268,7 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason="length",
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                prompt_tps=prompt_tps_map.get(uid),
                             )
                         )
                         rqueues[uid].put(None)
@@ -992,7 +1288,10 @@ class ResponseGenerator:
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
-        _, responses = batch_gen.next(**kwargs)
+        prompt_responses, responses = batch_gen.next(**kwargs)
+        for prompt_response in prompt_responses:
+            if prompt_response.uid in active:
+                active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
         if not responses:
             return
 
@@ -1018,6 +1317,7 @@ class ResponseGenerator:
                     logprobs=lp,
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
+                    prompt_tps=info.get("prompt_tps"),
                     top_logprobs=getattr(r, "top_logprobs", None),
                 )
             )
@@ -1028,19 +1328,29 @@ class ResponseGenerator:
 
     def _stream_text(self, info: dict, token: int, finish_reason: Optional[str]) -> str:
         """Convert one generated token into a streaming text segment."""
-        detokenizer = info["detokenizer"]
-        if finish_reason == "stop":
-            detokenizer.finalize()
-        else:
-            detokenizer.add_token(token)
-            if finish_reason is not None:
-                detokenizer.finalize()
-        return detokenizer.last_segment
+        return info["streamer"].advance(token, finish_reason)
 
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
         while batch_gen.has_pending_prompts:
             self._step(batch_gen, active)
+
+    def validate_context_budget(
+        self,
+        prompt: str,
+        images: Optional[List] = None,
+        audio: Optional[List] = None,
+        args: Optional[GenerationArguments] = None,
+    ):
+        """Validate request size before opening a streaming response."""
+        if get_configured_context_limit() is None:
+            return
+        self.wait_until_ready()
+        args = args or GenerationArguments(max_tokens=get_server_max_tokens())
+        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        _check_configured_context_budget(
+            _count_prompt_tokens(raw_inputs), args.max_tokens
+        )
 
 
 def suppress_tool_call_content(
@@ -1058,7 +1368,8 @@ def suppress_tool_call_content(
     if not in_tool_call:
         if tc_start in full_output:
             return True, None
-        if any(full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))):
+
+        if any(full_output.endswith(tc_start[:j]) for j in range(2, len(tc_start))):
             return False, None
     else:
         return True, None
@@ -1165,6 +1476,38 @@ def _read_tenant_id(http_request) -> Optional[str]:
         return None
     h = http_request.headers
     return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+
+
+async def _preflight_stream_context_budget(
+    *,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    images: Optional[List] = None,
+    audio: Optional[List] = None,
+    args: GenerationArguments,
+):
+    """Reject over-budget streaming requests before the HTTP stream starts."""
+    if response_generator is None:
+        return
+    try:
+        await asyncio.to_thread(
+            response_generator.validate_context_budget,
+            prompt,
+            images,
+            audio,
+            args,
+        )
+    except PromptTooLongError as e:
+        server_metrics.record_failure(
+            endpoint=endpoint,
+            model=model,
+            stream=True,
+            error=str(e),
+        )
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _as_plain_dict(value):
@@ -1297,6 +1640,7 @@ apc_manager: Optional[_apc.APCManager] = None
 
 # Loading/unloading utilities
 model_cache = {}
+server_metrics = ServerMetricsStore()
 
 
 @asynccontextmanager
@@ -2082,9 +2426,29 @@ async def responses_endpoint(request: Request):
 
         if openai_request.stream:
             # Streaming response
+            server_metrics.begin_request(
+                endpoint="/responses",
+                model=openai_request.model,
+                stream=True,
+            )
+            await _preflight_stream_context_budget(
+                endpoint="/responses",
+                model=openai_request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=None,
+                args=gen_args,
+            )
+
             async def stream_generator():
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                metrics_finalized = False
+                token_times: List[float] = []
+                prompt_tps = None
+                generation_tps = None
+                peak_memory = 0.0
+                finish_reason = None
                 try:
                     # Create base response object (to match the openai pipeline)
                     base_response = OpenAIResponse(
@@ -2158,6 +2522,12 @@ async def responses_endpoint(request: Request):
                             output_tokens += 1
                             delta = token.text
                             full_text += delta
+                            token_times.append(time.perf_counter())
+                            peak_memory = max(
+                                peak_memory,
+                                float(getattr(token, "peak_memory", 0.0) or 0.0),
+                            )
+                            prompt_tps = getattr(token, "prompt_tps", prompt_tps)
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
@@ -2167,6 +2537,7 @@ async def responses_endpoint(request: Request):
                             await asyncio.sleep(0.01)
 
                             if token.finish_reason:
+                                finish_reason = token.finish_reason
                                 break
                     else:
                         # Fallback to stream_generate
@@ -2191,6 +2562,15 @@ async def responses_endpoint(request: Request):
 
                             delta = chunk.text
                             full_text += delta
+                            token_times.append(time.perf_counter())
+                            prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
+                            generation_tps = getattr(
+                                chunk, "generation_tps", generation_tps
+                            )
+                            peak_memory = max(
+                                peak_memory,
+                                float(getattr(chunk, "peak_memory", 0.0) or 0.0),
+                            )
                             usage_stats = {
                                 "input_tokens": chunk.prompt_tokens,
                                 "output_tokens": chunk.generation_tokens,
@@ -2222,6 +2602,34 @@ async def responses_endpoint(request: Request):
                     yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
 
                     # Send response.completed event (to match the openai pipeline)
+                    finish_reason = finish_reason or (
+                        "stop" if usage_stats["output_tokens"] > 0 else None
+                    )
+                    envelope = _build_metrics_envelope(
+                        endpoint="/responses",
+                        model=openai_request.model,
+                        stream=True,
+                        backend=(
+                            "continuous_batching"
+                            if response_generator is not None
+                            else "generate"
+                        ),
+                        prompt_tokens=usage_stats["input_tokens"],
+                        completion_tokens=usage_stats["output_tokens"],
+                        generated_tokens=usage_stats["output_tokens"],
+                        request_elapsed_s=time.perf_counter() - request_start,
+                        request_started_s=request_start,
+                        token_times=token_times,
+                        prompt_tps=prompt_tps,
+                        generation_tps=generation_tps,
+                        peak_memory_gb=peak_memory or None,
+                        finish_reason=finish_reason,
+                        image_count=len(images),
+                        structured_output=bool(gen_args.logits_processors),
+                        thinking_enabled=bool(gen_args.enable_thinking),
+                    )
+                    server_metrics.record_success(envelope)
+                    metrics_finalized = True
                     completed_response = base_response.model_copy(
                         update={
                             "status": "completed",
@@ -2237,6 +2645,14 @@ async def responses_endpoint(request: Request):
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
+                    if not metrics_finalized:
+                        server_metrics.record_failure(
+                            endpoint="/responses",
+                            model=openai_request.model,
+                            stream=True,
+                            error=str(e),
+                        )
+                        metrics_finalized = True
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
                     error_data = json.dumps({"error": str(e)})
@@ -2248,6 +2664,13 @@ async def responses_endpoint(request: Request):
                             token_iter.close()
                         except Exception:
                             pass
+                    if not metrics_finalized:
+                        server_metrics.record_failure(
+                            endpoint="/responses",
+                            model=openai_request.model,
+                            stream=True,
+                            error="stream_closed_before_completion",
+                        )
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -2264,10 +2687,20 @@ async def responses_endpoint(request: Request):
 
         else:
             # Non-streaming response
+            server_metrics.begin_request(
+                endpoint="/responses",
+                model=openai_request.model,
+                stream=False,
+            )
             try:
                 full_text = ""
                 prompt_tokens = 0
                 output_tokens = 0
+                token_times: List[float] = []
+                prompt_tps = None
+                generation_tps = None
+                peak_memory = 0.0
+                finish_reason = None
 
                 if response_generator is not None:
 
@@ -2279,20 +2712,34 @@ async def responses_endpoint(request: Request):
                         )
                         text = ""
                         ot = 0
+                        tt: List[float] = []
+                        ptps = None
+                        pm = 0.0
+                        fr = None
                         for tok in ti:
                             text += tok.text
                             ot += 1
+                            tt.append(time.perf_counter())
+                            ptps = getattr(tok, "prompt_tps", ptps)
+                            pm = max(pm, float(getattr(tok, "peak_memory", 0.0) or 0.0))
                             if tok.finish_reason:
+                                fr = tok.finish_reason
                                 break
                         try:
                             ti.close()
                         except Exception:
                             pass
-                        return ctx_.prompt_tokens, text, ot
+                        return ctx_.prompt_tokens, text, ot, tt, ptps, pm, fr
 
-                    prompt_tokens, full_text, output_tokens = await asyncio.to_thread(
-                        _blocking_resp
-                    )
+                    (
+                        prompt_tokens,
+                        full_text,
+                        output_tokens,
+                        token_times,
+                        prompt_tps,
+                        peak_memory,
+                        finish_reason,
+                    ) = await asyncio.to_thread(_blocking_resp)
                 else:
                     result = generate(
                         model=model,
@@ -2308,6 +2755,10 @@ async def responses_endpoint(request: Request):
                     full_text = result.text
                     prompt_tokens = result.prompt_tokens
                     output_tokens = result.generation_tokens
+                    prompt_tps = getattr(result, "prompt_tps", None)
+                    generation_tps = getattr(result, "generation_tps", None)
+                    peak_memory = float(getattr(result, "peak_memory", 0.0) or 0.0)
+                    finish_reason = "stop"
 
                 mx.clear_cache()
                 gc.collect()
@@ -2359,9 +2810,50 @@ async def responses_endpoint(request: Request):
                         resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
                     )
 
+                envelope = _build_metrics_envelope(
+                    endpoint="/responses",
+                    model=openai_request.model,
+                    stream=False,
+                    backend=(
+                        "continuous_batching"
+                        if response_generator is not None
+                        else "generate"
+                    ),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=output_tokens,
+                    generated_tokens=output_tokens,
+                    request_elapsed_s=elapsed,
+                    request_started_s=request_start,
+                    token_times=token_times,
+                    prompt_tps=prompt_tps,
+                    generation_tps=generation_tps,
+                    peak_memory_gb=peak_memory or None,
+                    finish_reason=finish_reason,
+                    image_count=len(images),
+                    structured_output=bool(gen_args.logits_processors),
+                    thinking_enabled=bool(gen_args.enable_thinking),
+                )
+                server_metrics.record_success(envelope)
+
                 return response
 
+            except PromptTooLongError as e:
+                server_metrics.record_failure(
+                    endpoint="/responses",
+                    model=openai_request.model,
+                    stream=False,
+                    error=str(e),
+                )
+                mx.clear_cache()
+                gc.collect()
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
+                server_metrics.record_failure(
+                    endpoint="/responses",
+                    model=openai_request.model,
+                    stream=False,
+                    error=str(e),
+                )
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
                 mx.clear_cache()
@@ -2422,19 +2914,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if isinstance(message.content, str):
                 msg["content"] = message.content
             elif isinstance(message.content, list):
-                text_content = ""
-                for item in message.content:
-                    if isinstance(item, dict):
-                        if message.role == "user":
-                            if item["type"] == "input_image":
-                                images.append(item["image_url"])
-                            elif item["type"] == "image_url":
-                                images.append(item["image_url"]["url"])
-                            elif item["type"] == "input_audio":
-                                audio.append(item["input_audio"]["data"])
-                        if item["type"] in ("text", "input_text"):
-                            text_content = item.get("text", "")
-                msg["content"] = text_content
+                if message.role == "user":
+                    for item in message.content:
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = item.get("type")
+                        if item_type == "input_image":
+                            images.append(item["image_url"])
+                        elif item_type == "image_url":
+                            images.append(item["image_url"]["url"])
+                        elif item_type == "input_audio":
+                            audio.append(item["input_audio"]["data"])
+                msg["content"] = extract_text_from_content(message.content)
             else:
                 msg["content"] = message.content
 
@@ -2498,11 +2989,37 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
+            server_metrics.begin_request(
+                endpoint="/chat/completions",
+                model=request.model,
+                stream=True,
+            )
+            await _preflight_stream_context_budget(
+                endpoint="/chat/completions",
+                model=request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=audio if audio else None,
+                args=gen_args,
+            )
+
             async def stream_generator():
                 global response_generator
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                metrics_finalized = False
+                token_times: List[float] = []
+                prompt_tps = None
+                generation_tps = None
+                peak_memory = 0.0
+                finish_reason = None
                 try:
+                    output_tokens = 0
+                    full_output = ""
+                    output_text = ""
+                    stream_prompt_tokens = 0
+                    tool_calls_made = False
+
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if response_generator is not None:
                         # generate() does blocking Queue.get — run off event loop
@@ -2538,6 +3055,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             output_tokens += 1
                             accumulated += token.text
                             full_output += token.text
+                            token_times.append(time.perf_counter())
+                            peak_memory = max(
+                                peak_memory,
+                                float(getattr(token, "peak_memory", 0.0) or 0.0),
+                            )
+                            prompt_tps = getattr(token, "prompt_tps", prompt_tps)
 
                             # Detect thinking boundaries
                             delta_reasoning = None
@@ -2620,12 +3143,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                             if token.finish_reason:
+                                finish_reason = token.finish_reason
                                 break
 
                         # Parse tool calls from full output and emit final chunk
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
                             if tc["calls"]:
+                                tool_calls_made = True
+                                finish_reason = "tool_calls"
                                 choices = [
                                     ChatStreamChoice(
                                         finish_reason="tool_calls",
@@ -2667,6 +3193,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 continue
 
                             output_text += chunk.text
+                            stream_prompt_tokens = chunk.prompt_tokens
+                            token_times.append(time.perf_counter())
+                            output_tokens = chunk.generation_tokens
+                            prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
+                            generation_tps = getattr(
+                                chunk, "generation_tps", generation_tps
+                            )
+                            peak_memory = max(
+                                peak_memory,
+                                float(getattr(chunk, "peak_memory", 0.0) or 0.0),
+                            )
 
                             choices = [
                                 ChatStreamChoice(
@@ -2691,6 +3228,44 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                             await asyncio.sleep(0.01)
 
+                    metrics_text = full_output or output_text
+                    completion_tokens = max(
+                        0, output_tokens - _count_thinking_tag_tokens(metrics_text)
+                    )
+                    envelope = _build_metrics_envelope(
+                        endpoint="/chat/completions",
+                        model=request.model,
+                        stream=True,
+                        backend=(
+                            "continuous_batching"
+                            if response_generator is not None
+                            else "generate"
+                        ),
+                        prompt_tokens=(
+                            ctx.prompt_tokens
+                            if response_generator is not None
+                            else stream_prompt_tokens
+                        ),
+                        completion_tokens=completion_tokens,
+                        generated_tokens=output_tokens,
+                        request_elapsed_s=time.perf_counter() - request_start,
+                        request_started_s=request_start,
+                        token_times=token_times,
+                        prompt_tps=prompt_tps,
+                        generation_tps=generation_tps,
+                        peak_memory_gb=peak_memory or None,
+                        finish_reason=finish_reason
+                        or ("stop" if output_tokens > 0 else None),
+                        image_count=len(images),
+                        audio_count=len(audio),
+                        structured_output=bool(gen_args.logits_processors),
+                        thinking_enabled=bool(gen_args.enable_thinking),
+                        tool_parser=tool_parser_type,
+                        tool_calls=tool_calls_made,
+                    )
+                    server_metrics.record_success(envelope)
+                    metrics_finalized = True
+
                     # Signal stream end
                     yield "data: [DONE]\n\n"
 
@@ -2702,6 +3277,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     )
 
                 except Exception as e:
+                    if not metrics_finalized:
+                        server_metrics.record_failure(
+                            endpoint="/chat/completions",
+                            model=request.model,
+                            stream=True,
+                            error=str(e),
+                        )
+                        metrics_finalized = True
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
                     error_data = json.dumps({"error": str(e)})
@@ -2714,6 +3297,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token_iter.close()
                         except Exception:
                             pass
+                    if not metrics_finalized:
+                        server_metrics.record_failure(
+                            endpoint="/chat/completions",
+                            model=request.model,
+                            stream=True,
+                            error="stream_closed_before_completion",
+                        )
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -2730,11 +3320,20 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         else:
             # Non-streaming response
+            server_metrics.begin_request(
+                endpoint="/chat/completions",
+                model=request.model,
+                stream=False,
+            )
             try:
                 full_text = ""
                 prompt_tokens = 0
                 output_tokens = 0
                 peak_memory = 0.0
+                token_times: List[float] = []
+                prompt_tps = None
+                generation_tps = None
+                finish_reason = None
 
                 collected_logprobs: List[
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
@@ -2746,6 +3345,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         text = ""
                         pt = gt = 0
                         pm = 0.0
+                        tt: List[float] = []
+                        ptps = None
+                        fr = None
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
@@ -2756,22 +3358,31 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         for token in token_iter:
                             text += token.text
                             gt += 1
+                            tt.append(time.perf_counter())
+                            ptps = getattr(token, "prompt_tps", ptps)
                             pm = token.peak_memory
                             if request.logprobs and token.finish_reason != "stop":
                                 collected_logprobs.append(
                                     (token.token, token.logprobs, token.top_logprobs)
                                 )
                             if token.finish_reason:
+                                fr = token.finish_reason
                                 break
                         try:
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, pm
+                        return text, pt, gt, ptps, pm, tt, fr
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        prompt_tps,
+                        peak_memory,
+                        token_times,
+                        finish_reason,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,
@@ -2788,7 +3399,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     full_text = gen_result.text
                     prompt_tokens = gen_result.prompt_tokens
                     output_tokens = gen_result.generation_tokens
-                    peak_memory = gen_result.peak_memory
+                    peak_memory = float(getattr(gen_result, "peak_memory", 0.0) or 0.0)
+                    prompt_tps = getattr(gen_result, "prompt_tps", None)
+                    generation_tps = getattr(gen_result, "generation_tps", None)
+                    finish_reason = "stop"
 
                 mx.clear_cache()
                 gc.collect()
@@ -2804,6 +3418,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tps=float(prompt_tps or 0.0),
+                    generation_tps=float(generation_tps or 0.0),
                     peak_memory=peak_memory,
                 )
 
@@ -2883,9 +3499,55 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
                     )
 
+                envelope = _build_metrics_envelope(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=False,
+                    backend=(
+                        "continuous_batching"
+                        if response_generator is not None
+                        else "generate"
+                    ),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    generated_tokens=output_tokens,
+                    request_elapsed_s=elapsed,
+                    request_started_s=request_start,
+                    token_times=token_times,
+                    prompt_tps=prompt_tps,
+                    generation_tps=generation_tps,
+                    peak_memory_gb=peak_memory or None,
+                    finish_reason=(
+                        "tool_calls" if parsed_tool_calls else finish_reason or "stop"
+                    ),
+                    image_count=len(images),
+                    audio_count=len(audio),
+                    structured_output=bool(gen_args.logits_processors),
+                    thinking_enabled=bool(gen_args.enable_thinking),
+                    tool_parser=tool_parser_type,
+                    tool_calls=bool(parsed_tool_calls),
+                )
+                server_metrics.record_success(envelope)
+
                 return result
 
+            except PromptTooLongError as e:
+                server_metrics.record_failure(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=False,
+                    error=str(e),
+                )
+                mx.clear_cache()
+                gc.collect()
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
+                server_metrics.record_failure(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=False,
+                    error=str(e),
+                )
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
                 mx.clear_cache()
@@ -2958,23 +3620,27 @@ async def health_check():
         if response_generator is not None
         else None
     )
-    config = model_cache.get("config")
-    text_config = getattr(config, "text_config", None)
-
+    runtime = _server_runtime_snapshot()
     return {
         "status": "healthy",
-        "loaded_model": model_cache.get("model_path", None),
-        "loaded_adapter": model_cache.get("adapter_path", None),
-        "loaded_context_size": getattr(text_config, "max_position_embeddings", None),
-        "loaded_tool_parser": (
-            _infer_tool_parser_from_processor(model_cache.get("processor"))
-            if model_cache.get("processor")
-            else None
-        ),
-        "continuous_batching_enabled": response_generator is not None,
+        "loaded_model": runtime["loaded_model"],
+        "loaded_adapter": runtime["loaded_adapter"],
+        "loaded_context_size": runtime["loaded_context_size"],
+        "configured_context_limit": runtime["configured_context_limit"],
+        "effective_context_limit": runtime["effective_context_limit"],
+        "loaded_tool_parser": runtime["loaded_tool_parser"],
+        "continuous_batching_enabled": runtime["continuous_batching_enabled"],
         "generation": generation,
-        "apc_enabled": apc_manager is not None,
+        "apc_enabled": runtime["apc"]["enabled"],
     }
+
+
+@app.get("/metrics")
+@app.get("/v1/metrics", include_in_schema=False)
+async def metrics_endpoint():
+    payload = server_metrics.snapshot()
+    payload["server"] = _server_runtime_snapshot()
+    return payload
 
 
 @app.get("/v1/cache/stats")
@@ -3193,6 +3859,7 @@ def main():
         port=args.port,
         workers=1,
         reload=args.reload,
+        server_header=False,
     )
 
 

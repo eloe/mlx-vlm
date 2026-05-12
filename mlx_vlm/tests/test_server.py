@@ -1,5 +1,6 @@
 import time
 from queue import Queue
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,8 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
+import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
-from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer
+from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
 @pytest.fixture
@@ -44,26 +46,32 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
 
 
 def test_speculative_server_dispatches_mtp_batch_loop():
-    assert server._get_speculative_rounds_batch("mtp") is server._mtp_rounds_batch
+    assert (
+        speculative_utils.get_speculative_rounds_batch("mtp")
+        is speculative_utils._mtp_rounds_batch
+    )
 
 
 def test_speculative_server_keeps_dflash_default_batch_loop():
-    assert server._get_speculative_rounds_batch("dflash") is server._dflash_rounds_batch
+    assert (
+        speculative_utils.get_speculative_rounds_batch("dflash")
+        is speculative_utils._dflash_rounds_batch
+    )
 
 
 def test_speculative_server_rejects_unknown_draft_kind():
     with pytest.raises(ValueError):
-        server._get_speculative_rounds_batch("nope")
+        speculative_utils.get_speculative_rounds_batch("nope")
 
 
 def test_speculative_server_prefill_kwargs_are_drafter_specific():
     drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[1, 2, 3]))
 
-    assert server._speculative_prefill_kwargs("mtp", drafter) == {
+    assert speculative_utils.speculative_prefill_kwargs("mtp", drafter) == {
         "return_hidden": True,
         "return_shared_kv": True,
     }
-    assert server._speculative_prefill_kwargs("dflash", drafter) == {
+    assert speculative_utils.speculative_prefill_kwargs("dflash", drafter) == {
         "capture_layer_ids": [1, 2, 3],
     }
 
@@ -72,15 +80,65 @@ def test_speculative_server_hidden_state_picks_last_layer_for_mtp():
     h = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     out = SimpleNamespace(hidden_states=h)
 
-    assert server._speculative_hidden_state("mtp", out) is h[-1]
+    assert speculative_utils.speculative_hidden_state("mtp", out) is h[-1]
 
 
 def test_speculative_server_hidden_state_concatenates_for_dflash():
     h = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     out = SimpleNamespace(hidden_states=h)
 
-    result = server._speculative_hidden_state("dflash", out)
+    result = speculative_utils.speculative_hidden_state("dflash", out)
     assert result.shape == (1, 1, 8)
+
+
+def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatch):
+    lm = object()
+    unbatched_cache = object()
+    batched_cache = object()
+
+    monkeypatch.setattr(
+        speculative_utils.cache, "make_prompt_cache", lambda target: unbatched_cache
+    )
+
+    result = speculative_utils.make_speculative_prompt_cache(
+        lm,
+        draft_kind="mtp",
+        batch_size=1,
+        left_padding=[0],
+        make_cache=lambda *args, **kwargs: batched_cache,
+    )
+
+    assert result is unbatched_cache
+
+
+def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeypatch):
+    lm = object()
+    batched_cache = object()
+
+    monkeypatch.setattr(
+        speculative_utils.cache, "make_prompt_cache", lambda target: pytest.fail()
+    )
+
+    assert (
+        speculative_utils.make_speculative_prompt_cache(
+            lm,
+            draft_kind="mtp",
+            batch_size=2,
+            left_padding=[0, 1],
+            make_cache=lambda *args, **kwargs: batched_cache,
+        )
+        is batched_cache
+    )
+    assert (
+        speculative_utils.make_speculative_prompt_cache(
+            lm,
+            draft_kind="dflash",
+            batch_size=1,
+            left_padding=[0],
+            make_cache=lambda *args, **kwargs: batched_cache,
+        )
+        is batched_cache
+    )
 
 
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):
@@ -89,6 +147,17 @@ def test_speculative_server_reads_draft_block_size_env(monkeypatch):
 
     monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "3")
     assert server._get_draft_block_size_from_env() == 3
+
+
+def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", raising=False)
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
+
+    monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "2.5")
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.0025)
+
+    monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "bad")
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
 class _RecordingSpeculativeLM:
@@ -147,6 +216,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: [])
     monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: None)
+    monkeypatch.setattr(server, "get_speculative_batch_coalesce_s", lambda: 0.0)
 
     class _FakeDetokenizer:
         def __init__(self):
@@ -167,12 +237,11 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     def fake_rounds(*args, **kwargs):
         del args
+        gen.round_kwargs = kwargs
         gen._stop = True
         yield ([4] * int(kwargs["first_bonus"].shape[0]), None)
 
-    monkeypatch.setattr(
-        server, "_get_speculative_rounds_batch", lambda kind: fake_rounds
-    )
+    monkeypatch.setattr(server, "run_speculative_server_rounds", fake_rounds)
 
     args = server.GenerationArguments(max_tokens=2, temperature=0)
     for spec in request_specs:
@@ -187,7 +256,28 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
         )
 
     gen._run_speculative()
-    return lm.calls[0]
+    call = lm.calls[0]
+    call["round_kwargs"] = gen.round_kwargs
+    return call
+
+
+def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+            {
+                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+        ],
+    )
+
+    assert call["round_kwargs"]["greedy_sampling"] is True
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -305,6 +395,112 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+                "stream": True,
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "demo",
+                "input": "Hello",
+                "max_output_tokens": 4,
+                "stream": True,
+            },
+        ),
+    ],
+)
+def test_v1_stream_endpoints_reject_over_context_before_sse(
+    client, monkeypatch, path, payload
+):
+    class OverBudgetResponseGenerator:
+        generate_called = False
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            raise server.PromptTooLongError(
+                "Request needs 9 context tokens "
+                "(5 prompt + 4 max generation), but MAX_KV_SIZE is 8."
+            )
+
+        def generate(self, *args, **kwargs):
+            self.generate_called = True
+            raise AssertionError("streaming should not start")
+
+    response_generator = OverBudgetResponseGenerator()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "response_generator", response_generator)
+    monkeypatch.setattr(
+        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 400
+    assert "MAX_KV_SIZE is 8" in response.json()["detail"]
+    assert response_generator.generate_called is False
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "demo",
+                "input": "Hello",
+                "max_output_tokens": 4,
+            },
+        ),
+    ],
+)
+def test_v1_non_stream_endpoints_reject_over_context(
+    client, monkeypatch, path, payload
+):
+    class OverBudgetResponseGenerator:
+        def generate(self, *args, **kwargs):
+            raise server.PromptTooLongError(
+                "Request needs 9 context tokens "
+                "(5 prompt + 4 max generation), but MAX_KV_SIZE is 8."
+            )
+
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "response_generator", OverBudgetResponseGenerator())
+    monkeypatch.setattr(
+        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 400
+    assert "MAX_KV_SIZE is 8" in response.json()["detail"]
+
+
 def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -349,6 +545,112 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
 
 
+def test_chat_completions_streaming_forwards_explicit_sampling_args(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            captured["prompt"] = prompt
+            captured["images"] = images
+            captured["audio"] = audio
+            captured["args"] = args
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="done", token=1, logprobs=0.0, finish_reason="stop"
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "max_tokens": 12,
+                "top_k": 40,
+                "min_p": 0.08,
+                "repetition_penalty": 1.15,
+                "logit_bias": {"12": -1.5},
+            },
+        )
+
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
+    assert captured["args"].max_tokens == 12
+    assert captured["args"].top_k == 40
+    assert captured["args"].min_p == 0.08
+    assert captured["args"].repetition_penalty == 1.15
+    assert captured["args"].logit_bias == {12: -1.5}
+
+
+def test_chat_completions_endpoint_flattens_text_content_parts(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "First text block."},
+                            {"type": "text", "text": "Second text block."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "user",
+            "content": "First text block. Second text block.",
+        }
+    ]
+
+
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     monkeypatch.setattr(server, "apc_manager", None)
 
@@ -376,6 +678,107 @@ def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     manager.clear.assert_called_once_with()
 
 
+def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "apc_manager", None)
+    monkeypatch.setattr(server, "response_generator", None)
+    monkeypatch.setattr(server, "model_cache", {})
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["latest"] is None
+    assert payload["recent"] == []
+    assert payload["summary"]["requests_started"] == 0
+    assert payload["summary"]["requests_completed"] == 0
+    assert payload["summary"]["requests_failed"] == 0
+    assert payload["server"]["loaded_model"] is None
+    assert payload["server"]["apc"] == {"enabled": False}
+
+
+def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "apc_manager", None)
+    monkeypatch.setattr(server, "response_generator", None)
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(max_position_embeddings=4096),
+    )
+    processor = SimpleNamespace()
+    model = SimpleNamespace()
+    monkeypatch.setattr(
+        server,
+        "model_cache",
+        {
+            "model_path": "demo-model",
+            "adapter_path": None,
+            "config": config,
+            "processor": processor,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        MagicMock(return_value=(model, processor, config)),
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+    monkeypatch.setattr(
+        server,
+        "generate",
+        MagicMock(
+            return_value=SimpleNamespace(
+                text="Hello there",
+                prompt_tokens=12,
+                generation_tokens=5,
+                prompt_tps=120.0,
+                generation_tps=50.0,
+                peak_memory=1.25,
+            )
+        ),
+    )
+
+    response = client.post(
+        "/chat/completions",
+        json={
+            "model": "demo-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    payload = metrics.json()
+
+    latest = payload["latest"]
+    assert latest["endpoint"] == "/chat/completions"
+    assert latest["model"] == "demo-model"
+    assert latest["stream"] is False
+    assert latest["backend"] == "generate"
+    assert latest["prompt_tokens"] == 12
+    assert latest["completion_tokens"] == 5
+    assert latest["generated_tokens"] == 5
+    assert latest["prefill_tok_s"] == 120.0
+    assert latest["decode_tok_s"] == 50.0
+    assert latest["peak_memory_gb"] == 1.25
+    assert latest["image_count"] == 0
+    assert latest["audio_count"] == 0
+    assert latest["apc_enabled"] is False
+
+    assert len(payload["recent"]) == 1
+    assert payload["summary"]["requests_started"] == 1
+    assert payload["summary"]["requests_completed"] == 1
+    assert payload["summary"]["requests_failed"] == 0
+    assert payload["summary"]["prompt_tokens_total"] == 12
+    assert payload["summary"]["completion_tokens_total"] == 5
+    assert payload["summary"]["generated_tokens_total"] == 5
+    assert payload["server"]["loaded_model"] == "demo-model"
+    assert payload["server"]["loaded_context_size"] == 4096
+
+
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
 
 
@@ -392,6 +795,42 @@ class TestResponseGenerator:
         gen.wait_until_ready = lambda: None
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
+
+    def test_generate_rejects_requests_over_configured_context_limit(self, monkeypatch):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen._cpu_preprocess = lambda prompt, images, audio: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        }
+        gen.requests = Queue()
+
+        monkeypatch.setenv("MAX_KV_SIZE", "8")
+
+        with pytest.raises(server.PromptTooLongError, match="MAX_KV_SIZE is 8"):
+            gen.generate("prompt", args=server.GenerationArguments(max_tokens=4))
+
+        assert gen.requests.empty()
+
+    def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
+        monkeypatch.setenv("MAX_KV_SIZE", "8")
+        monkeypatch.setattr(
+            server,
+            "model_cache",
+            {
+                "config": SimpleNamespace(
+                    text_config=SimpleNamespace(max_position_embeddings=16)
+                )
+            },
+        )
+        monkeypatch.setattr(server, "response_generator", None)
+        monkeypatch.setattr(server, "apc_manager", None)
+
+        runtime = server._server_runtime_snapshot()
+
+        assert runtime["loaded_context_size"] == 16
+        assert runtime["configured_context_limit"] == 8
+        assert runtime["effective_context_limit"] == 8
 
     def test_generate_arguments_defaults(self):
         args = server.GenerationArguments()
@@ -517,35 +956,46 @@ class TestResponseGenerator:
             next(token_iter)
         assert cancelled == []
 
-    def test_step_uses_streaming_detokenizer_for_utf8_byte_tokens(self):
-        class ByteFallbackTokenizer:
+    def test_collect_pending_requests_coalesces_after_first_item(self, monkeypatch):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.requests = Queue()
+        gen._stop = False
+        first = object()
+        second = object()
+        gen.requests.put(first)
+
+        def fake_sleep(seconds):
+            assert seconds == pytest.approx(0.005)
+            gen.requests.put(second)
+
+        monkeypatch.setattr(server.time, "sleep", fake_sleep)
+
+        pending, should_stop = gen._collect_pending_requests(
+            active=False, coalesce_s=0.005
+        )
+
+        assert pending == [first, second]
+        assert should_stop is False
+
+    def test_step_streams_spm_subword_tokens_immediately(self):
+        class SentencePieceTokenizer:
             vocab = {
-                "hi": 0,
-                "<0xF0>": 1,
-                "<0x9F>": 2,
-                "<0x98>": 3,
-                "<0x80>": 4,
+                "▁hello": 0,
+                "world": 1,
+                "!": 2,
             }
 
             def decode(self, tokens):
-                text = ""
-                byte_buffer = bytearray()
-                byte_values = {1: 0xF0, 2: 0x9F, 3: 0x98, 4: 0x80}
-
-                def flush_bytes():
-                    nonlocal text, byte_buffer
-                    if byte_buffer:
-                        text += byte_buffer.decode("utf-8", errors="replace")
-                        byte_buffer = bytearray()
-
+                parts = []
                 for token in tokens:
-                    if token == 0:
-                        flush_bytes()
-                        text += "hi"
-                    else:
-                        byte_buffer.append(byte_values[token])
-                flush_bytes()
-                return text
+                    parts.append(
+                        {
+                            0: " hello",
+                            1: "world",
+                            2: "!",
+                        }[token]
+                    )
+                return "".join(parts).lstrip()
 
         class SingleResponseBatch:
             def __init__(self, response):
@@ -554,20 +1004,21 @@ class TestResponseGenerator:
             def next(self, **kwargs):
                 return [], [self.response]
 
-        tokenizer = ByteFallbackTokenizer()
-        processor = SimpleNamespace(
-            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
-        )
+        tokenizer = SentencePieceTokenizer()
+        processor = SimpleNamespace(detokenizer=SPMStreamingDetokenizer(tokenizer))
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         rqueue = Queue()
         active = {
             1: {
                 "rqueue": rqueue,
-                "detokenizer": server.make_streaming_detokenizer(processor),
+                "streamer": _ServerTokenStreamer(
+                    tokenizer,
+                    server.make_streaming_detokenizer(processor),
+                ),
             }
         }
 
-        for token in [0, 1, 2, 3, 4]:
+        for token in [0, 1, 2]:
             gen._step(
                 SingleResponseBatch(
                     SimpleNamespace(
@@ -591,14 +1042,365 @@ class TestResponseGenerator:
             active,
         )
 
-        streamed_text = ""
+        segments = []
         while not rqueue.empty():
             item = rqueue.get()
             if item is not None:
-                streamed_text += item.text
+                segments.append(item.text)
 
-        assert streamed_text == "hi😀"
+        assert segments == ["hello", "world", "!", ""]
+
+    def test_server_token_streamer_flushes_incomplete_utf8_on_finalize(self):
+        class ByteFallbackTokenizer:
+            vocab = {
+                "<0xF0>": 0,
+                "<0x9F>": 1,
+            }
+
+            def decode(self, tokens):
+                byte_values = {0: 0xF0, 1: 0x9F}
+                return bytes(byte_values[token] for token in tokens).decode(
+                    "utf-8", errors="replace"
+                )
+
+        tokenizer = ByteFallbackTokenizer()
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        )
+        streamer = _ServerTokenStreamer(
+            tokenizer,
+            server.make_streaming_detokenizer(processor),
+        )
+
+        assert streamer.advance(0, None) == ""
+        assert streamer.advance(1, None) == ""
+        assert streamer.finalize() == "\ufffd"
+
+    def test_step_streams_multiple_utf8_emojis_with_text_between_them(self):
+        class MixedEmojiTokenizer:
+            vocab = {
+                "hi": 0,
+                "<0xF0>": 1,
+                "<0x9F>": 2,
+                "<0x98>": 3,
+                "<0x80>": 4,
+                "▁mid": 5,
+                "<0x82>": 6,
+                "▁wow": 7,
+                "<0x8E>": 8,
+                "▁done": 9,
+            }
+
+            def decode(self, tokens):
+                text = ""
+                byte_buffer = bytearray()
+                byte_values = {
+                    1: 0xF0,
+                    2: 0x9F,
+                    3: 0x98,
+                    4: 0x80,
+                    6: 0x82,
+                    8: 0x8E,
+                }
+                regular = {0: "hi", 5: "▁mid", 7: "▁wow", 9: "▁done"}
+
+                def flush_bytes():
+                    nonlocal text, byte_buffer
+                    if byte_buffer:
+                        text += byte_buffer.decode("utf-8", errors="replace")
+                        byte_buffer = bytearray()
+
+                for token in tokens:
+                    if token in byte_values:
+                        byte_buffer.append(byte_values[token])
+                    else:
+                        flush_bytes()
+                        text += regular[token].replace("▁", " ")
+                flush_bytes()
+                return text
+
+        class SingleResponseBatch:
+            def __init__(self, response):
+                self.response = response
+
+            def next(self, **kwargs):
+                return [], [self.response]
+
+        tokenizer = MixedEmojiTokenizer()
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        )
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rqueue = Queue()
+        active = {
+            1: {
+                "rqueue": rqueue,
+                "streamer": _ServerTokenStreamer(
+                    tokenizer,
+                    server.make_streaming_detokenizer(processor),
+                ),
+            }
+        }
+
+        for token in [0, 1, 2, 3, 4, 5, 1, 2, 3, 6, 7, 1, 2, 3, 8, 9, 1, 2, 3, 4]:
+            gen._step(
+                SingleResponseBatch(
+                    SimpleNamespace(
+                        uid=1,
+                        token=token,
+                        token_logprob=0.0,
+                        finish_reason=None,
+                    )
+                ),
+                active,
+            )
+        gen._step(
+            SingleResponseBatch(
+                SimpleNamespace(
+                    uid=1,
+                    token=99,
+                    token_logprob=0.0,
+                    finish_reason="stop",
+                )
+            ),
+            active,
+        )
+
+        segments = []
+        while not rqueue.empty():
+            item = rqueue.get()
+            if item is not None:
+                segments.append(item.text)
+
+        streamed_text = "".join(segments)
+        assert segments == [
+            "hi",
+            "",
+            "",
+            "",
+            "😀",
+            " mid",
+            "",
+            "",
+            "",
+            "😂",
+            " wow",
+            "",
+            "",
+            "",
+            "😎",
+            " done",
+            "",
+            "",
+            "",
+            "😀",
+            "",
+        ]
+        assert streamed_text == "hi😀 mid😂 wow😎 done😀"
         assert "\ufffd" not in streamed_text
+
+    def test_run_batches_eight_streaming_requests(self, monkeypatch):
+        batch_state = {}
+
+        class FakeDetokenizer:
+            def __init__(self):
+                self.last_segment = ""
+
+            def reset(self):
+                self.last_segment = ""
+
+            def add_token(self, token):
+                self.last_segment = str(token)
+
+            def finalize(self):
+                pass
+
+        class FakeBatchGenerator:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+                self._next_uid = 1
+                self._active = {}
+                self.inserted_uids = []
+                self.next_active_sizes = []
+                batch_state["instance"] = self
+
+            def insert(self, *args, **kwargs):
+                del args, kwargs
+                uid = self._next_uid
+                self._next_uid += 1
+                self._active[uid] = 0
+                self.inserted_uids.append(uid)
+                return (uid,)
+
+            def remove(self, uid):
+                return self._active.pop(uid, None) is not None
+
+            @property
+            def unprocessed_prompts(self):
+                return []
+
+            @property
+            def has_pending_prompts(self):
+                return False
+
+            def next(self, **kwargs):
+                del kwargs
+                self.next_active_sizes.append(len(self._active))
+                responses = []
+                finished = []
+                for uid in sorted(self._active):
+                    step = self._active[uid]
+                    token = uid * 10 + step
+                    finish_reason = None if step == 0 else "length"
+                    responses.append(
+                        SimpleNamespace(
+                            uid=uid,
+                            token=token,
+                            token_logprob=0.0,
+                            finish_reason=finish_reason,
+                        )
+                    )
+                    if finish_reason is None:
+                        self._active[uid] = step + 1
+                    else:
+                        finished.append(uid)
+                for uid in finished:
+                    del self._active[uid]
+                return [], responses
+
+        monkeypatch.setattr(server, "BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(
+            server, "make_streaming_detokenizer", lambda _: FakeDetokenizer()
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.model_path = "demo"
+        gen.adapter_path = None
+        gen.model = None
+        gen.processor = None
+        gen.config = None
+        gen.stop_tokens = set()
+        gen.vision_cache = None
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen.kv_bits = None
+        gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+        gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+        gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+        gen.top_logprobs_k = 0
+        gen.apc_manager = None
+        gen.tokenizer = SimpleNamespace()
+        gen.requests = Queue()
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+        gen._cancelled = set()
+        gen._cancel_lock = Lock()
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = None
+            gen.draft_kind = None
+            gen.tokenizer = SimpleNamespace()
+
+        gen._initialize_model = fake_initialize_model
+        gen._gpu_embed = lambda raw_inputs, images=None: (
+            mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
+            {},
+        )
+
+        request_queues = []
+        for request_id in range(8):
+            rqueue = Queue()
+            request_queues.append(rqueue)
+            gen.requests.put(
+                (
+                    rqueue,
+                    {"request_id": request_id},
+                    1,
+                    server.GenerationArguments(max_tokens=2),
+                    None,
+                )
+            )
+
+        worker = Thread(target=gen._run, daemon=True)
+        worker.start()
+
+        streamed_by_uid = {}
+        try:
+            for rqueue in request_queues:
+                ctx = rqueue.get(timeout=1)
+                assert isinstance(ctx, server.GenerationContext)
+                assert ctx.prompt_tokens == 1
+
+                items = []
+                while True:
+                    item = rqueue.get(timeout=1)
+                    if item is None:
+                        break
+                    items.append((item.text, item.finish_reason))
+                streamed_by_uid[ctx.uid] = items
+        finally:
+            gen._stop = True
+            gen.requests.put(None)
+            worker.join(timeout=2)
+
+        batch_gen = batch_state["instance"]
+        assert batch_gen.inserted_uids == list(range(1, 9))
+        assert batch_gen.next_active_sizes[:2] == [8, 8]
+        assert len(streamed_by_uid) == 8
+        for uid, items in streamed_by_uid.items():
+            assert items == [
+                (str(uid * 10), None),
+                (str(uid * 10 + 1), "length"),
+            ]
+
+    def test_step_attaches_prompt_tps_from_prompt_progress(self):
+        class SimpleTokenizer:
+            vocab = {"hi": 0}
+
+            def decode(self, tokens):
+                return "hi" if tokens else ""
+
+        class PromptProgressBatch:
+            def next(self, **kwargs):
+                return (
+                    [SimpleNamespace(uid=1, prompt_tps=184.431)],
+                    [
+                        SimpleNamespace(
+                            uid=1,
+                            token=0,
+                            token_logprob=0.0,
+                            finish_reason="stop",
+                        )
+                    ],
+                )
+
+        tokenizer = SimpleTokenizer()
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        )
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rqueue = Queue()
+        active = {
+            1: {
+                "rqueue": rqueue,
+                "streamer": _ServerTokenStreamer(
+                    tokenizer,
+                    server.make_streaming_detokenizer(processor),
+                ),
+                "prompt_tps": None,
+            }
+        }
+
+        gen._step(PromptProgressBatch(), active)
+
+        item = rqueue.get()
+        assert item.prompt_tps == pytest.approx(184.431)
+        assert rqueue.get() is None
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
@@ -735,8 +1537,6 @@ class TestResponseGenerator:
         )
 
         assert server._build_gen_args(req).enable_thinking is True
-
-        assert args.enable_thinking is True
 
     def test_fail_active_requests_notifies_and_clears_streams(self):
         gen = self._bare_generator()
@@ -1024,6 +1824,13 @@ class TestSuppressToolCallContent:
         )
         assert in_tc is False
         assert content is None
+
+    def test_literal_less_than_is_not_suppressed(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "if n <", False, "<tool_call>", "<"
+        )
+        assert in_tc is False
+        assert content == "<"
 
 
 class TestProcessToolCalls:
